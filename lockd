@@ -1,0 +1,385 @@
+#!/usr/bin/env bash
+# lockd — lazy, kind encryption for regular humans. age underneath.
+#
+# The deal (announced in the literature, kept by the code):
+#   * encrypt a file or directory with ONE word: `lockd`
+#   * the passphrase you type unlocks your default key (created for you
+#     the first time, if you don't have one)
+#   * the original is wiped BY DEFAULT - but only after the ciphertext
+#     is decrypted back and byte-verified against the original. If
+#     verification fails, the original survives and lockd says so loudly.
+#     `--keep` skips the wipe entirely.
+#   * "no other options going forward" on the password window (or
+#     `--fast`) makes lockd get out of your face: encrypt, verify, wipe,
+#     done. `--full` overrides it for one run. The choice is remembered.
+#
+# Scoping: v1. Email signing/encryption + contact-card key sharing are
+# phase 2. Name note: the kernel's NFS lock daemon owns the string
+# `lockd` in some contexts (man lockd on NFS boxes) - accepted.
+
+set -euo pipefail
+
+CONFIG_DIR="${HOME}/.config/lockd"
+CONFIG="${CONFIG_DIR}/config"
+IDENTITY="${CONFIG_DIR}/identity.txt"
+BOOKMARKS="${HOME}/.config/gtk-3.0/bookmarks"
+
+KEEP=0; FAST_RUN=0; FULL_RUN=0; DECRYPT=0; OPEN=0; SHRED_MODE=0
+FAST_PATH=0        # loaded from config
+NEW_KEY=0
+
+say()  { printf '%s\n' "$*"; }
+notify() {  # GUI runs have no stdout - speak through the desktop instead
+    [[ -n "${DISPLAY:-}" ]] && command -v notify-send >/dev/null \
+        && notify-send --hint=int:transient:1 "lockd" "$*" 2>/dev/null || true
+}
+die()  {
+    printf 'lockd: %s\n' "$*" >&2
+    if command -v yad >/dev/null && [[ -n "${DISPLAY:-}" ]]; then
+        yad --title="lockd" --borders=12 --error --text="$*" --width=460 2>/dev/null || true
+    fi
+    exit 1
+}
+need() { command -v "$1" >/dev/null || die "missing: $1"; }
+
+yad_form() {  # gui helpers (yad required; it is the checkbox provider)
+    need yad
+    yad --title="lockd" --borders=12 --form --separator='|' "$@"
+}
+yad_err() { need yad; yad --title="lockd" --borders=12 --error --text="$*" --width=420 2>/dev/null || true; }
+yad_q()   { need yad; yad --title="lockd" --borders=12 --question --text="$*" --width=420 2>/dev/null; }
+
+identity_path() {
+    # config override -> stock lockd path. Also scanned for adoption:
+    # ~/.config/age/keys.txt, ~/.config/sops/age/keys.txt, ~/.config/rage/identities
+    local p; p=$(config_get identity_path)
+    [[ -n "$p" ]] && { printf '%s' "$p"; return; }
+    printf '%s' "$IDENTITY"
+}
+
+config_get() {
+    [[ -f "$CONFIG" ]] && grep -E "^$1=" "$CONFIG" | tail -1 | cut -d= -f2- || true
+}
+config_set() {
+    mkdir -p "$CONFIG_DIR"
+    touch "$CONFIG"
+    if grep -qE "^$1=" "$CONFIG" 2>/dev/null; then
+        sed -i "s|^$1=.*|$1=$2|" "$CONFIG"
+    else
+        printf '%s=%s\n' "$1" "$2" >> "$CONFIG"
+    fi
+}
+
+# unlock the passphrase-encrypted identity via a pty (age reads
+# passphrases from the terminal only; script(1) provides the terminal).
+# Returns 0 and echoes the temp plaintext-identity path on success.
+unlock_identity() {
+    local pw wdir tmpid
+    wdir=$(mktemp -d /tmp/lockd-id.XXXXXX)
+    tmpid="$wdir/id"                       # must NOT exist: age refuses -o over
+    chmod 600 "$tmpid" 2>/dev/null || true
+    pw=$(yad_form \
+        --field="Unlock key passphrase:":H \
+        --field="  (confirm):":H \
+        --field="No other options going forward:":CHK) || die "cancelled"
+    local upw cpw chk
+    IFS='|' read -r upw cpw chk <<<"$pw"
+    [[ "$upw" == "$cpw" ]] || { shred -uzn1 "$tmpid" 2>/dev/null; rm -rf "$wdir"; die "passphrases do not match"; }
+    [[ -n "$upw" ]] || { shred -uzn1 "$tmpid" 2>/dev/null; rm -rf "$wdir"; die "empty passphrase"; }
+    if [[ "$chk" == TRUE ]]; then config_set fast_path 1; fi
+    local cmd
+    cmd=$(printf 'age -d -o %q %q' "$tmpid" "$(identity_path)")
+    printf '%s\n' "$upw" | script -qfec "$cmd" /dev/null >/dev/null 2>&1 \
+        || { shred -uzn1 "$tmpid" 2>/dev/null; rm -rf "$wdir"; die "wrong passphrase (or no key): unlock failed"; }
+    # the unlocked file must contain a real secret key - catches corrupt
+    # or wrong-file identities instead of failing later, mid-flow
+    grep -q "AGE-SECRET-KEY-" "$tmpid" \
+        || { shred -uzn1 "$tmpid" 2>/dev/null; rm -rf "$wdir"; die "identity file is not a valid age key"; }
+    printf '%s' "$tmpid"
+}
+
+STANDARD_KEY_SPOTS=(
+    "${HOME}/.config/age/keys.txt"
+    "${HOME}/.config/sops/age/keys.txt"
+    "${HOME}/.config/rage/identities"
+)
+
+ensure_key() {
+    local id; id=$(identity_path)
+    [[ -f "$id" ]] && return 0
+    # kind discovery: adopt an existing age key by reference (never copy
+    # secrets around); standard spots first.
+    for spot in "${STANDARD_KEY_SPOTS[@]}"; do
+        if [[ -f "$spot" ]]; then
+            if yad_q "Found an existing age key:\n${spot}\n\nAdopt it as your lockd default? (referenced, not copied)"; then
+                config_set identity_path "$spot"
+                say "adopted: $spot"
+                return 0
+            fi
+        fi
+    done
+    yad_q "No default AGE key found.\n(gpg keys are a different system - they do not apply here.)\n\nCreate one now? It becomes your lockd default.\nLives at: ${IDENTITY}" \
+        || die "no key, no lock"
+    local pw
+    pw=$(yad_form \
+        --field="New key passphrase:":H \
+        --field="  (confirm):":H \
+        --field="No other options going forward:":CHK) || die "cancelled"
+    local npw cpw chk
+    IFS='|' read -r npw cpw chk <<<"$pw"
+    [[ -n "$npw" ]] || die "empty passphrase"
+    [[ "$npw" == "$cpw" ]] || die "passphrases do not match"
+    if [[ "$chk" == TRUE ]]; then config_set fast_path 1; fi
+    mkdir -p "$CONFIG_DIR"
+    local id; id=$(identity_path)
+    local wdir; wdir=$(mktemp -d /tmp/lockd-birth.XXXXXX)
+    local plain; plain="$wdir/plain"       # non-existent: age writes fresh
+    age-keygen -o "$plain" >/dev/null 2>&1 || { rm -rf "$wdir"; die "keygen failed"; }
+    # BUG FIX 2026-09-03: the first version ran 'age -p -o ID' with NO input
+    # file, so age encrypted STDIN - the passphrase lines themselves - and
+    # called it an identity. Key birth must be: keygen to a plain file,
+    # then encrypt THAT FILE (input as argument, passphrase via the pty).
+    local cmd
+    cmd=$(printf 'age -p -o %q %q' "$id" "$plain")
+    printf '%s\n%s\n' "$npw" "$npw" | script -qfec "$cmd" /dev/null >/dev/null 2>&1 \
+        || { rm -rf "$wdir"; die "key encryption failed"; }
+    shred -uzn1 "$plain"
+    [[ -f "$id" ]] || { rm -rf "$wdir"; die "key creation produced nothing"; }
+    chmod 600 "$id"; chmod 700 "$CONFIG_DIR" 2>/dev/null || true
+    # birth certificate: the locked file must actually CONTAIN a key
+    local check; check="$wdir/check"
+    cmd=$(printf 'age -d -o %q %q' "$check" "$id")
+    printf '%s\n%s\n' "$npw" "$npw" | script -qfec "$cmd" /dev/null >/dev/null 2>&1 \
+        && grep -q "AGE-SECRET-KEY-" "$check" \
+        || { rm -rf "$wdir"; shred -uzn1 "$id" 2>/dev/null; die "created key failed verification - nothing saved, run lockd again"; }
+    rm -rf "$wdir"
+    say "key created + verified: $id"
+    NEW_KEY=1
+}
+
+usage() {
+    cat <<'EOF'
+lockd — lazy, kind encryption (age underneath)
+
+  lockd [paths...]          encrypt files (or a directory: one archive)
+  lockd --shred paths...    secure-wipe any file (no encryption involved)
+  lockd -d paths...         decrypt .age files (originals of THIS run are
+                            .age files; shredding them is offered, not forced)
+  lockd -k|--keep           encrypt but never wipe the originals
+  lockd -f|--fast           this run: no send/extra offers
+  lockd --full              this run: offers even if fast-path is saved
+  lockd --selftest          crypto roundtrip + wipe semantics, headless
+
+Wipe rule: originals are shredded BY DEFAULT, but only after the
+ciphertext verifies byte-for-byte. If verification fails, the original
+survives and lockd says so. "No other options going forward" on the
+password window saves the fast path permanently.
+EOF
+}
+
+do_selftest() {
+    local t; t=$(mktemp -d /tmp/lockd-selftest.XXXXXX)
+    trap "shred -uzn1 '$t'/* 2>/dev/null; rm -rf '$t'" EXIT
+    printf 'lockd selftest payload %s\n' "$(date)" > "$t/plain.txt"
+    # identity for the test (unencrypted temp; no passphrase machinery)
+    AGE_IDENTITY="$t/testkey.txt" age-keygen -o "$t/testkey.txt" >/dev/null 2>&1
+    local pub; pub=$(AGE_IDENTITY="$t/testkey.txt" age-keygen -y "$t/testkey.txt")
+    # encrypt -> verify -> shred -> decrypt -> compare
+    age -r "$pub" -o "$t/plain.txt.age" "$t/plain.txt"
+    [[ -f "$t/plain.txt.age" ]] || { echo "FAIL: no ciphertext"; return 1; }
+    age -d -i "$t/testkey.txt" -o "$t/verify.txt" "$t/plain.txt.age"
+    cmp -s "$t/plain.txt" "$t/verify.txt" || { echo "FAIL: roundtrip mismatch"; return 1; }
+    shred -uzn1 "$t/plain.txt"
+    [[ ! -e "$t/plain.txt" ]] || { echo "FAIL: shred left the original"; return 1; }
+    age -d -i "$t/testkey.txt" -o "$t/roundtrip.txt" "$t/plain.txt.age"
+    grep -q "lockd selftest payload" "$t/roundtrip.txt" || { echo "FAIL: content"; return 1; }
+    echo "selftest: PASS (encrypt/verify/shred/decrypt roundtrip)"
+}
+
+pick_files() {
+    need yad
+    yad --title="lockd — pick what to encrypt" --borders=12 \
+        --file-selection --multiple --separator='\n' --width=720 2>/dev/null || true
+}
+
+send_offers() {
+    [[ $FAST_RUN -eq 1 ]] && return 0
+    [[ $(config_get fast_path) == "1" ]] && return 0
+    local pub="$1"; shift
+    local choice
+    choice=$(yad --title="lockd — what now?" --borders=12 --list --hide-column=1 \
+        --column="id" --column="option" --print-column=1 --width=520 --height=280 \
+        "pub"    "Copy public key to clipboard" \
+        "email"  "Email the encrypted file(s) (claws-mail)" \
+        "place"  "Copy to a Place (your bookmarks)" \
+        "done"   "Done" 2>/dev/null | cut -d'|' -f1) || choice="done"
+    case "$choice" in
+        pub)
+            printf '%s' "$pub" | xclip -selection clipboard \
+                && say "public key copied to clipboard" ;;
+        email)
+            local args="" f
+            for f in "$@"; do args+=" --attach=$(printf %q "$f")"; done
+            claws-mail $args >/dev/null 2>&1 & disown || true
+            say "claws-mail opened with the encrypted file(s) attached" ;;
+        place)
+            [[ -f "$BOOKMARKS" ]] || { say "no bookmarks (places) found"; break 2>/dev/null || true; return 0; }
+            local places pick
+            places=$(sed 's|^file://||; s| .*$||' "$BOOKMARKS" | grep -v '^$')
+            pick=$(yad --title="lockd — pick a Place" --borders=12 --list --hide-column=1 \
+                --column="path" --column="Place" --print-column=1 --width=560 --height=360 \
+                $(while read -r p; do printf '%q %q\n' "$p" "$(basename "$p")"; done <<<"$places") \
+                2>/dev/null | cut -d'|' -f1) || pick=""
+            if [[ -n "$pick" && -d "$pick" ]]; then
+                local f
+                for f in "$@"; do cp -v "$f" "$pick/"; done
+                say "copied to Place: $pick"
+            fi ;;
+    esac
+}
+
+do_encrypt() {
+    need age; need age-keygen; need xclip
+    ensure_key
+    local tmpid; tmpid=$(unlock_identity)
+    trap "shred -uzn1 '$tmpid' 2>/dev/null" EXIT
+    local pub; pub=$(age-keygen -y "$tmpid")
+
+    local paths=("$@")
+    if (( ${#paths[@]} == 0 )); then
+        mapfile -t paths < <(pick_files)
+        (( ${#paths[@]} > 0 )) || die "nothing picked"
+    fi
+
+    local made=() p out base
+    for p in "${paths[@]}"; do
+        [[ -e "$p" ]] || { say "skip: $p (missing)"; continue; }
+        if [[ -d "$p" ]]; then
+            base="$(basename "$p").tar.gz.age"
+            out="$(dirname "$p")/$base"
+            tar -C "$(dirname "$p")" -czf - "$(basename "$p")" \
+                | age -r "$pub" -o "$out"
+        else
+            out="${p}.age"
+            age -r "$pub" -o "$out" "$p"
+        fi
+        [[ -s "$out" ]] || { yad_err "encryption produced nothing: $out"; return 1; }
+        # verify-then-shred: the wipe rule can never lie
+        local vdir; vdir=$(mktemp -d /tmp/lockd-vf.XXXXXX)
+        local vcmp; vcmp="$vdir/verify"        # non-existent: age writes fresh
+        if age -d -i "$tmpid" -o "$vcmp" "$out" 2>/dev/null && cmp -s "$vcmp" "$p"; then
+            if [[ $KEEP -eq 1 ]]; then
+                say "verified: $out (original kept: --keep)"
+            else
+                shred -uzn1 "$p" && say "verified + wiped: $p  ->  $out"
+            fi
+        else
+            rm -rf "$vdir"; shred -uzn1 "$out" 2>/dev/null || true
+            yad_err "VERIFICATION FAILED for $p\nThe original was KEPT and the bad ciphertext was destroyed.\nNothing was lost. That is the rule."
+            say "VERIFICATION FAILED: $p kept, bad ciphertext destroyed"
+            continue
+        fi
+        rm -rf "$vdir"
+        made+=("$out")
+    done
+    (( ${#made[@]} > 0 )) || { say "nothing encrypted"; return 0; }
+
+    # fast-path check: run flag > saved config
+    if [[ $FULL_RUN -eq 0 ]] && { [[ $FAST_RUN -eq 1 ]] || [[ $(config_get fast_path) == "1" ]]; }; then
+        say "fast path: ${#made[@]} file(s) locked. done."
+        return 0
+    fi
+    send_offers "$pub" "${made[@]}"
+    if [[ $NEW_KEY -eq 1 ]]; then
+        say "your new public key: $pub"
+        say "(phase 2 will offer: email signing, contact-card sharing)"
+    fi
+}
+
+do_shred() {
+    # the wipe rule's machinery, standing alone: secure-wipe any file
+    local paths=("$@")
+    if (( ${#paths[@]} == 0 )); then
+        need yad
+        mapfile -t paths < <(yad --title="lockd — pick file(s) to wipe" --borders=12 \
+            --file-selection --multiple --separator='\n' --width=720 2>/dev/null || true)
+        (( ${#paths[@]} > 0 )) || die "nothing picked"
+    fi
+    yad_q "Securely wipe ${#paths[@]} item(s)?\nThis cannot be undone." || die "cancelled"
+    local p
+    for p in "${paths[@]}"; do
+        if [[ -f "$p" ]]; then
+            shred -uzn1 "$p" && notify "wiped: $(basename "$p")" && say "wiped: $p"
+        else
+            say "skip: $p (not a regular file)"
+        fi
+    done
+}
+
+do_decrypt() {
+    need age; need age-keygen
+    [[ -f "$(identity_path)" ]] || die "no default key to unlock"
+    local tmpid; tmpid=$(unlock_identity)
+    trap "shred -uzn1 '$tmpid' 2>/dev/null" EXIT
+    local paths=("$@")
+    if (( ${#paths[@]} == 0 )); then
+        need yad
+        mapfile -t paths < <(yad --title="lockd — pick .age to decrypt" --borders=12 \
+            --file-selection --multiple --separator='\n' --width=720 \
+            --file-filter="age files | *.age" 2>/dev/null || true)
+        (( ${#paths[@]} > 0 )) || die "nothing picked"
+    fi
+    local p out
+    for p in "${paths[@]}"; do
+        [[ -f "$p" ]] || { say "skip: $p (missing)"; continue; }
+        case "$p" in
+            *.tar.gz.age) out="${p%.tar.gz.age}.unlocked.tar.gz" ;;
+            *.age)        out="${p%.age}" ;;
+            *)            out="${p}.decrypted" ;;
+        esac
+        age -d -i "$tmpid" -o "$out" "$p"
+        say "decrypted: $p  ->  $out"
+    done
+    if [[ $OPEN -eq 1 ]]; then
+        local first="${paths[0]}"
+        case "$first" in
+            *.tar.gz.age) first="${first%.tar.gz.age}.unlocked.tar.gz" ;;
+            *.age)        first="${first%.age}" ;;
+        esac
+        [[ -e "$first" ]] && { notify "unlocked: $(basename "$first")"; xdg-open "$first" >/dev/null 2>&1 & disown; }
+    fi
+    if yad_q "Shred the source .age file(s) now?\n(the decrypted output stays, of course)"; then
+        for p in "${paths[@]}"; do [[ -f "$p" ]] && shred -uzn1 "$p" && say "wiped: $p"; done
+    fi
+}
+
+main() {
+    local args=()
+    while (( $# > 0 )); do
+        case "$1" in
+            -k|--keep)   KEEP=1 ;;
+            -f|--fast)   FAST_RUN=1 ;;
+            --full)      FULL_RUN=1 ;;
+            -d|--decrypt) DECRYPT=1 ;;
+            --open)       OPEN=1 ;;
+            --shred)     SHRED_MODE=1 ;;
+            --selftest)  do_selftest; exit $? ;;
+            -h|--help)   usage; exit 0 ;;
+            -*)          die "unknown flag: $1 (see --help)" ;;
+            *)           args+=("$1") ;;
+        esac
+        shift
+    done
+    need script; need shred; need cmp
+    # the key file defends itself regardless of umask or home perms:
+    # dir 700, identity 600 (ciphertext stays shareable - that is the
+    # point of encryption; the KEY is the crown jewel)
+    mkdir -p "$CONFIG_DIR"
+    chmod 700 "$CONFIG_DIR" 2>/dev/null || true
+    local idnow; idnow=$(identity_path)
+    [[ -f "$idnow" ]] && chmod 600 "$idnow" 2>/dev/null || true
+    if [[ $SHRED_MODE -eq 1 ]]; then do_shred "${args[@]}";
+    elif [[ $DECRYPT -eq 1 ]]; then do_decrypt "${args[@]}"; else do_encrypt "${args[@]}"; fi
+}
+
+main "$@"
