@@ -2,6 +2,8 @@
 
 *rabmach — handy stuff for a debian desktop*
 
+*Built in the open: human-directed, AI-assisted ([opencode](https://github.com/anomalyco/opencode)), human-verified.*
+
 One word encrypts a file or a directory. `age` does the cryptography
 (Debian-packaged, MIT, modern); lockd does the *everything else* — the part
 that has kept normal people from encrypting anything for decades.
