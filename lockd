@@ -28,6 +28,8 @@ KEEP=0; FAST_RUN=0; FULL_RUN=0; DECRYPT=0; OPEN=0; SHRED_MODE=0
 FAST_PATH=0        # loaded from config
 NEW_KEY=0
 VFDIR=""           # current verify workspace (trap cleans it on any exit)
+STAGE=""           # current decrypt-restore staging (trap cleans on crash)
+RESTORED=""        # last thing decrypt put back on disk (for --open)
 
 say()  { printf '%s\n' "$*"; }
 notify() {  # GUI runs have no stdout - speak through the desktop instead
@@ -166,6 +168,8 @@ lockd — lazy, kind encryption (age underneath)
   lockd --shred paths...    secure-wipe any file (no encryption involved)
   lockd -d paths...         decrypt .age files (originals of THIS run are
                             .age files; shredding them is offered, not forced)
+                            directory archives restore the tree in place -
+                            streamed, never overwriting, no archive residue
   lockd -k|--keep           encrypt but never wipe the originals
   lockd -f|--fast           this run: no send/extra offers
   lockd --full              this run: offers even if fast-path is saved
@@ -255,7 +259,7 @@ do_encrypt() {
     need age; need age-keygen; need xclip
     ensure_key
     local tmpid; tmpid=$(unlock_identity)
-    trap 'shred -uzn1 "$tmpid" 2>/dev/null; [[ -n "${VFDIR:-}" ]] && rm -rf "${VFDIR}"; VFDIR=""' EXIT
+    trap 'shred -uzn1 "$tmpid" 2>/dev/null; [[ -n "${VFDIR:-}" ]] && rm -rf "${VFDIR}"; [[ -n "${STAGE:-}" ]] && rm -rf "${STAGE}"; VFDIR=""; STAGE=""' EXIT
     local pub; pub=$(age-keygen -y "$tmpid")
 
     local paths=("$@")
@@ -372,7 +376,7 @@ do_decrypt() {
     need age; need age-keygen
     [[ -f "$(identity_path)" ]] || die "no default key to unlock"
     local tmpid; tmpid=$(unlock_identity)
-    trap 'shred -uzn1 "$tmpid" 2>/dev/null; [[ -n "${VFDIR:-}" ]] && rm -rf "${VFDIR}"; VFDIR=""' EXIT
+    trap 'shred -uzn1 "$tmpid" 2>/dev/null; [[ -n "${VFDIR:-}" ]] && rm -rf "${VFDIR}"; [[ -n "${STAGE:-}" ]] && rm -rf "${STAGE}"; VFDIR=""; STAGE=""' EXIT
     local paths=("$@")
     if (( ${#paths[@]} == 0 )); then
         need yad
@@ -384,21 +388,60 @@ do_decrypt() {
     local p out
     for p in "${paths[@]}"; do
         [[ -f "$p" ]] || { say "skip: $p (missing)"; continue; }
+        if [[ "$p" == *.tar.gz.age ]]; then
+            # directory archive: stream-decrypt straight into extraction -
+            # the plaintext archive never exists as a file, the tree comes
+            # back in place, no residue (machiner spec: seamless, tight,
+            # safe)
+            local asz room stage root target moved=0
+            asz=$(stat -c %s "$p" 2>/dev/null || echo 0)
+            room=$(df -B1 --output=avail "$(dirname "$p")" 2>/dev/null | tail -1 | tr -d ' ')
+            if [[ -n "$room" ]] && (( asz > 0 && room < asz * 3 + 104857600 )); then
+                yad_err "Not enough free space beside $p to restore the tree.\nNeed ~$(( asz * 3 / 1073741824 + 1 ))GB, have $(( room / 1073741824 ))GB. Nothing was changed."
+                continue
+            fi
+            stage=$(mktemp -d "$(dirname "$p")/.lockd-ex.XXXXXX")
+            STAGE="$stage"
+            if ! age -d -i "$tmpid" "$p" 2>/dev/null | tar -xzf - -C "$stage"; then
+                yad_err "Restore failed - archive may be corrupt or extraction ran out of space.\nThe .age source is untouched. Partial output removed."
+                rm -rf "$stage"; STAGE=""
+                continue
+            fi
+            # move the tree into place - NEVER over an existing path. On a
+            # name conflict the restore is KEPT (staging dir) and pointed
+            # at, so nothing can be lost.
+            while IFS= read -r -d '' root; do
+                [[ -n "$root" ]] || continue
+                target="$(dirname "$p")/$(basename "$root")"
+                if [[ -e "$target" ]]; then
+                    say "conflict: $target already exists - restore kept at $root"
+                    notify "restore conflict - nothing overwritten"
+                    continue
+                fi
+                mv -- "$root" "$target" \
+                    && { say "restored: $target"; RESTORED="$target"; moved=$((moved+1)); }
+            done < <(find "$stage" -mindepth 1 -maxdepth 1 -print0)
+            if [[ -z "$(ls -A "$stage" 2>/dev/null)" ]]; then
+                rm -rf "$stage"; STAGE=""
+            else
+                STAGE=""   # conflict: staging kept on purpose - protect it from the trap
+            fi
+            (( moved > 0 )) || say "decrypted: $p (see messages above)"
+            continue
+        fi
         case "$p" in
-            *.tar.gz.age) out="${p%.tar.gz.age}.unlocked.tar.gz" ;;
-            *.age)        out="${p%.age}" ;;
-            *)            out="${p}.decrypted" ;;
+            *.age) out="${p%.age}" ;;
+            *)     out="${p}.decrypted" ;;
         esac
         age -d -i "$tmpid" -o "$out" "$p"
+        RESTORED="$out"
         say "decrypted: $p  ->  $out"
     done
     if [[ $OPEN -eq 1 ]]; then
-        local first="${paths[0]}"
-        case "$first" in
-            *.tar.gz.age) first="${first%.tar.gz.age}.unlocked.tar.gz" ;;
-            *.age)        first="${first%.age}" ;;
-        esac
-        [[ -e "$first" ]] && { notify "unlocked: $(basename "$first")"; xdg-open "$first" >/dev/null 2>&1 & disown; }
+        if [[ -n "${RESTORED:-}" && -e "$RESTORED" ]]; then
+            notify "unlocked: $(basename "$RESTORED")"
+            xdg-open "$RESTORED" >/dev/null 2>&1 & disown
+        fi
     fi
     if yad_q "Shred the source .age file(s) now?\n(the decrypted output stays, of course)"; then
         for p in "${paths[@]}"; do [[ -f "$p" ]] && shred -uzn1 "$p" && say "wiped: $p"; done
