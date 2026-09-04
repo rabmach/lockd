@@ -6,7 +6,9 @@
 
 One word encrypts a file or a directory. `age` does the cryptography
 (Debian-packaged, MIT, modern); lockd does the *everything else* — the part
-that has kept normal people from encrypting anything for decades.
+that has kept regular people from encrypting anything for decades.
+
+![lockd command line](cmdlnlockd.mp4)
 
 ```
 lockd                        → pick file(s) → password → done
@@ -38,6 +40,8 @@ No default key? lockd makes one (passphrase-protected, living at
 `~/.config/lockd/identity.txt`) and remembers it. From then on, the password
 you type unlocks that key. Your public key gets offered to the clipboard and
 to a Place of your choosing.
+
+![lockd right-click](rclockd.mp4)
 
 ## Fast, clean, out of your face
 
