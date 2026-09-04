@@ -193,7 +193,19 @@ do_selftest() {
     [[ ! -e "$t/plain.txt" ]] || { echo "FAIL: shred left the original"; return 1; }
     age -d -i "$t/testkey.txt" -o "$t/roundtrip.txt" "$t/plain.txt.age"
     grep -q "lockd selftest payload" "$t/roundtrip.txt" || { echo "FAIL: content"; return 1; }
-    echo "selftest: PASS (encrypt/verify/shred/decrypt roundtrip)"
+    # directory roundtrip: tar|age -> unpack + tree-diff (the verify path
+    # directories actually take)
+    mkdir -p "$t/dir/sub"
+    printf 'dir payload\n' > "$t/dir/top.txt"
+    printf 'nested payload\n' > "$t/dir/sub/deep.txt"
+    tar -C "$t" -czf - dir | age -r "$pub" -o "$t/dir.age"
+    [[ -s "$t/dir.age" ]] || { echo "FAIL: no directory ciphertext"; return 1; }
+    age -d -i "$t/testkey.txt" -o "$t/dirverify.tar.gz" "$t/dir.age"
+    mkdir -p "$t/x"
+    tar -xzf "$t/dirverify.tar.gz" -C "$t/x"
+    diff -r -q --no-dereference "$t/dir" "$t/x/dir" >/dev/null \
+        || { echo "FAIL: directory roundtrip mismatch"; return 1; }
+    echo "selftest: PASS (file + directory roundtrips, wipe semantics)"
 }
 
 pick_files() {
@@ -264,12 +276,35 @@ do_encrypt() {
             age -r "$pub" -o "$out" "$p"
         fi
         [[ -s "$out" ]] || { yad_err "encryption produced nothing: $out"; return 1; }
-        # verify-then-shred: the wipe rule can never lie
+        # verify-then-shred: the wipe rule can never lie. Files byte-compare;
+        # directories unpack the archive and diff the whole tree (a tar.gz
+        # can never byte-compare against a directory - BUG FIX 2026-09-04:
+        # directory encrypts always failed verification and shredded the
+        # good ciphertext).
         local vdir; vdir=$(mktemp -d /tmp/lockd-vf.XXXXXX)
         local vcmp; vcmp="$vdir/verify"        # non-existent: age writes fresh
-        if age -d -i "$tmpid" -o "$vcmp" "$out" 2>/dev/null && cmp -s "$vcmp" "$p"; then
+        local ok=0
+        if age -d -i "$tmpid" -o "$vcmp" "$out" 2>/dev/null; then
+            if [[ -d "$p" ]]; then
+                local vext="$vdir/extract"
+                mkdir -p "$vext"
+                tar -xzf "$vcmp" -C "$vext" 2>/dev/null \
+                    && diff -r -q --no-dereference "$p" "$vext/$(basename "$p")" >/dev/null 2>&1 \
+                    && ok=1
+            else
+                cmp -s "$vcmp" "$p" && ok=1
+            fi
+        fi
+        if [[ $ok -eq 1 ]]; then
             if [[ $KEEP -eq 1 ]]; then
                 say "verified: $out (original kept: --keep)"
+            elif [[ -d "$p" ]]; then
+                # recursive wipe: shred every regular file, then remove the
+                # tree (shred itself refuses directories)
+                local f
+                while IFS= read -r -d '' f; do shred -uzn1 "$f" 2>/dev/null || true; done \
+                    < <(find "$p" -type f -print0)
+                rm -rf -- "$p" && say "verified + wiped: $p  ->  $out"
             else
                 shred -uzn1 "$p" && say "verified + wiped: $p  ->  $out"
             fi
