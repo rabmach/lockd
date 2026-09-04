@@ -27,6 +27,7 @@ BOOKMARKS="${HOME}/.config/gtk-3.0/bookmarks"
 KEEP=0; FAST_RUN=0; FULL_RUN=0; DECRYPT=0; OPEN=0; SHRED_MODE=0
 FAST_PATH=0        # loaded from config
 NEW_KEY=0
+VFDIR=""           # current verify workspace (trap cleans it on any exit)
 
 say()  { printf '%s\n' "$*"; }
 notify() {  # GUI runs have no stdout - speak through the desktop instead
@@ -254,7 +255,7 @@ do_encrypt() {
     need age; need age-keygen; need xclip
     ensure_key
     local tmpid; tmpid=$(unlock_identity)
-    trap "shred -uzn1 '$tmpid' 2>/dev/null" EXIT
+    trap 'shred -uzn1 "$tmpid" 2>/dev/null; [[ -n "${VFDIR:-}" ]] && rm -rf "${VFDIR}"; VFDIR=""' EXIT
     local pub; pub=$(age-keygen -y "$tmpid")
 
     local paths=("$@")
@@ -281,7 +282,23 @@ do_encrypt() {
         # can never byte-compare against a directory - BUG FIX 2026-09-04:
         # directory encrypts always failed verification and shredded the
         # good ciphertext).
-        local vdir; vdir=$(mktemp -d /tmp/lockd-vf.XXXXXX)
+        # verify workspace lives NEXT TO THE CIPHERTEXT, not /tmp: many
+        # boxes have a small /tmp partition (this one: 921MB), and an
+        # ENOSPC mid-chain dies invisibly behind 2>/dev/null, misreporting
+        # as verification failure (BUG FIX 2026-09-04, field-found on a
+        # 1.4G directory). Pre-flight: the verify needs ~3x the payload
+        # (ciphertext + decrypted copy + extracted tree) - say so BEFORE
+        # encrypting anything.
+        local sz room
+        sz=$(du -sb "$p" 2>/dev/null | cut -f1); sz=${sz:-0}
+        room=$(df -B1 --output=avail "$(dirname "$out")" 2>/dev/null | tail -1 | tr -d ' ')
+        if [[ -n "$room" && "$sz" -gt 0 ]] && (( room < sz * 3 + 104857600 )); then
+            yad_err "Not enough free space beside the target to verify safely.\nNeed ~$(( sz * 3 / 1073741824 + 1 ))GB, have $(( room / 1073741824 ))GB on $(dirname "$out").\nNothing was encrypted. Free up space and run lockd again."
+            say "verify space short for $p - nothing encrypted"
+            continue
+        fi
+        local vdir; vdir=$(mktemp -d "$(dirname "$out")/.lockd-vf.XXXXXX")
+        VFDIR="$vdir"
         local vcmp; vcmp="$vdir/verify"        # non-existent: age writes fresh
         local ok=0
         if age -d -i "$tmpid" -o "$vcmp" "$out" 2>/dev/null; then
@@ -309,12 +326,12 @@ do_encrypt() {
                 shred -uzn1 "$p" && say "verified + wiped: $p  ->  $out"
             fi
         else
-            rm -rf "$vdir"; shred -uzn1 "$out" 2>/dev/null || true
+            rm -rf "$vdir"; VFDIR=""; shred -uzn1 "$out" 2>/dev/null || true
             yad_err "VERIFICATION FAILED for $p\nThe original was KEPT and the bad ciphertext was destroyed.\nNothing was lost. That is the rule."
             say "VERIFICATION FAILED: $p kept, bad ciphertext destroyed"
             continue
         fi
-        rm -rf "$vdir"
+        rm -rf "$vdir"; VFDIR=""
         made+=("$out")
     done
     (( ${#made[@]} > 0 )) || { say "nothing encrypted"; return 0; }
@@ -355,7 +372,7 @@ do_decrypt() {
     need age; need age-keygen
     [[ -f "$(identity_path)" ]] || die "no default key to unlock"
     local tmpid; tmpid=$(unlock_identity)
-    trap "shred -uzn1 '$tmpid' 2>/dev/null" EXIT
+    trap 'shred -uzn1 "$tmpid" 2>/dev/null; [[ -n "${VFDIR:-}" ]] && rm -rf "${VFDIR}"; VFDIR=""' EXIT
     local paths=("$@")
     if (( ${#paths[@]} == 0 )); then
         need yad
