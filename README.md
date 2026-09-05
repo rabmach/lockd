@@ -1,7 +1,7 @@
 # lockd — lazy, kind encryption
 
 
-Command line: $ lock (whatever), or handy right-click in Thunar. `age` does the cryptography
+Command line: $ lock (whatever), handy right-click in Thunar, or keybind: c'tarl+shift+E. `age` does the cryptography
 (Debian-packaged, MIT, modern); lockd does the *everything else* — people don't encrypt because 'complicated'. Nah.
 
 [![lockd command line — click to play](cmdlnlockd_t35.jpg)](https://github.com/user-attachments/assets/43247bdc-fa3a-42a3-826e-e79db5341cc5)
