@@ -13,6 +13,12 @@
 #     `--fast`) makes lockd get out of your face: encrypt, verify, wipe,
 #     done. `--full` overrides it for one run. The choice is remembered.
 #
+# Portability: lockd is not married to any desktop. Dialogs go through a
+# backend chain: $LOCKD_DIALOG (override) -> yad -> zenity -> kdialog ->
+# a plain terminal mode (read from stdin, which also makes lockd work
+# over ssh and on a bare console). Clipboard: wl-copy -> xclip -> xsel.
+# Mailer: $LOCKD_MAILER -> xdg-email -> claws-mail.
+#
 # Scoping: v1. Email signing/encryption + contact-card key sharing are
 # phase 2. Name note: the kernel's NFS lock daemon owns the string
 # `lockd` in some contexts (man lockd on NFS boxes) - accepted.
@@ -22,7 +28,6 @@ set -euo pipefail
 CONFIG_DIR="${HOME}/.config/lockd"
 CONFIG="${CONFIG_DIR}/config"
 IDENTITY="${CONFIG_DIR}/identity.txt"
-BOOKMARKS="${HOME}/.config/gtk-3.0/bookmarks"
 
 KEEP=0; FAST_RUN=0; FULL_RUN=0; DECRYPT=0; OPEN=0; SHRED_MODE=0
 FAST_PATH=0        # loaded from config
@@ -30,27 +35,182 @@ NEW_KEY=0
 VFDIR=""           # current verify workspace (trap cleans it on any exit)
 STAGE=""           # current decrypt-restore staging (trap cleans on crash)
 RESTORED=""        # last thing decrypt put back on disk (for --open)
+TMPID=""           # unlocked temp identity + its dir (trap shreds on any
+                   # exit). must be a GLOBAL: the EXIT trap fires after the
+                   # flow functions return, and their locals are gone by
+                   # then (field-found 2026-09-05: local tmpid meant the
+                   # trap always hit 'unbound variable' - every run exited
+                   # rc=1 and the unlocked key was never shredded)
+DLG=""             # resolved dialog backend ("" until dlg_backend runs)
 
 say()  { printf '%s\n' "$*"; }
 notify() {  # GUI runs have no stdout - speak through the desktop instead
     [[ -n "${DISPLAY:-}" ]] && command -v notify-send >/dev/null \
         && notify-send --hint=int:transient:1 "lockd" "$*" 2>/dev/null || true
 }
-die()  {
-    printf 'lockd: %s\n' "$*" >&2
-    if command -v yad >/dev/null && [[ -n "${DISPLAY:-}" ]]; then
-        yad --title="lockd" --borders=12 --error --text="$*" --width=460 2>/dev/null || true
-    fi
-    exit 1
-}
 need() { command -v "$1" >/dev/null || die "missing: $1"; }
 
-yad_form() {  # gui helpers (yad required; it is the checkbox provider)
-    need yad
-    yad --title="lockd" --borders=12 --form --separator='|' "$@"
+# ---------- dialog backend layer ----------
+# resolved once per run. tty mode reads the terminal (stdin), so the
+# whole flow - key birth included - works over ssh with no GUI at all.
+dlg_backend() {
+    [[ -n "$DLG" ]] && return 0
+    local want="${LOCKD_DIALOG:-}"
+    if [[ -n "$want" ]]; then
+        if [[ "$want" == tty ]]; then DLG="tty"
+        elif command -v "$want" >/dev/null 2>&1; then DLG="$want"
+        else
+            printf 'lockd: LOCKD_DIALOG=%s not installed - using terminal mode\n' "$want" >&2
+            DLG="tty"
+        fi
+        return 0
+    fi
+    if [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" ]]; then
+        local c
+        for c in yad zenity kdialog; do
+            command -v "$c" >/dev/null 2>&1 && { DLG="$c"; return 0; }
+        done
+    fi
+    DLG="tty"
 }
-yad_err() { need yad; yad --title="lockd" --borders=12 --error --text="$*" --width=420 2>/dev/null || true; }
-yad_q()   { need yad; yad --title="lockd" --borders=12 --question --text="$*" --width=420 2>/dev/null; }
+
+# ask passphrase + confirm + fast-path checkbox.
+# -> three lines on stdout: passphrase, confirm, TRUE|FALSE. rc!=0 = cancelled.
+# (zenity forms and kdialog passwords have no checkbox - the fast path
+# becomes a follow-up question there, as agreed.)
+# NOTE: fields are newline-separated, so passwords may contain | and ;
+# (a password with a literal newline is still out of scope everywhere).
+dlg_form() {
+    dlg_backend
+    local NL=$'\n' out chk
+    case "$DLG" in
+        yad)
+            out=$(yad --title="lockd" --borders=12 --form --separator="$NL" \
+                --field="Passphrase:":H --field="  (confirm):":H \
+                --field="No other options going forward:":CHK 2>/dev/null) || return 1 ;;
+        zenity)
+            out=$(zenity --forms --title="lockd" --separator="$NL" \
+                --add-password="Passphrase" --add-password="  (confirm)" 2>/dev/null) || return 1
+            chk=FALSE
+            # zenity's form has no checkbox widget - the fast-path choice
+            # becomes a follow-up question, asked ONCE per key lifetime.
+            # after that: one window, creds, enter, bam.
+            if [[ $(config_get fast_path) != "1" && $(config_get fastpath_asked) != "1" ]]; then
+                zenity --question --title="lockd" \
+                    --text="No other options going forward?\n(yes: encrypt, verify, done - this is asked only once)" 2>/dev/null && chk=TRUE
+                config_set fastpath_asked 1
+            fi
+            out+="${NL}${chk}" ;;
+        kdialog)
+            local p1 p2
+            p1=$(kdialog --title lockd --password "Passphrase" 2>/dev/null) || return 1
+            p2=$(kdialog --title lockd --password "  (confirm)" 2>/dev/null) || return 1
+            chk=FALSE
+            if [[ $(config_get fast_path) != "1" && $(config_get fastpath_asked) != "1" ]]; then
+                kdialog --title lockd --yesno "No other options going forward? (yes: encrypt, verify, done - asked only once)" 2>/dev/null && chk=TRUE
+                config_set fastpath_asked 1
+            fi
+            out="${p1}${NL}${p2}${NL}${chk}" ;;
+        tty)
+            local p1 p2 a
+            read -rs -p "lockd passphrase: " p1 || return 1; printf '\n' >&2
+            read -rs -p "  (confirm): " p2 || return 1; printf '\n' >&2
+            read -r  -p "No other options going forward? [y/N] " a || a=""
+            chk=FALSE; [[ "$a" == y* ]] && chk=TRUE
+            out="${p1}${NL}${p2}${NL}${chk}" ;;
+        *) return 1 ;;
+    esac
+    if [[ "$out" != *$'\n'* ]]; then return 1; fi   # a form always has >= 2 fields
+    printf '%s' "$out"
+}
+
+die() {  # stderr always; GUI backends also get a window
+    printf 'lockd: %s\n' "$*" >&2
+    dlg_backend
+    if [[ "$DLG" != "tty" ]]; then dlg_err "$*"; fi
+    exit 1
+}
+
+dlg_err() {  # error dialog (tty: stderr, already covered by die)
+    dlg_backend
+    case "$DLG" in
+        yad)     yad --title="lockd" --borders=12 --error --text="$*" --width=420 2>/dev/null || true ;;
+        zenity)  zenity --error --title="lockd" --text="$*" 2>/dev/null || true ;;
+        kdialog) kdialog --title lockd --error "$*" 2>/dev/null || true ;;
+    esac
+}
+
+dlg_q() {  # question; rc 0 = yes
+    dlg_backend
+    case "$DLG" in
+        yad)     yad --title="lockd" --borders=12 --question --text="$*" --width=420 2>/dev/null ;;
+        zenity)  zenity --question --title="lockd" --text="$*" 2>/dev/null ;;
+        kdialog) kdialog --title lockd --yesno "$*" 2>/dev/null ;;
+        tty)     local a; read -r -p "lockd: $* [y/N] " a || return 1; [[ "$a" == y* ]] ;;
+        *)       return 1 ;;
+    esac
+}
+
+dlg_pick() {  # $1 title, $2 optional "name | *.ext" filter -> paths on stdout
+    dlg_backend
+    local title="$1" filter="${2:-}"
+    case "$DLG" in
+        yad)
+            if [[ -n "$filter" ]]; then
+                yad --title="$title" --borders=12 --file-selection --multiple \
+                    --separator='\n' --width=720 --file-filter="$filter" 2>/dev/null || true
+            else
+                yad --title="$title" --borders=12 --file-selection --multiple \
+                    --separator='\n' --width=720 2>/dev/null || true
+            fi ;;
+        zenity)
+            if [[ -n "$filter" ]]; then
+                zenity --file-selection --multiple --separator='\n' --title="$title" \
+                    --file-filter="$filter" 2>/dev/null || true
+            else
+                zenity --file-selection --multiple --separator='\n' --title="$title" 2>/dev/null || true
+            fi ;;
+        kdialog)
+            # kdialog wants "pattern|description" (sides swapped vs yad/zenity)
+            local f="*|All files"
+            [[ -n "$filter" ]] && f="${filter#*| }|${filter% |*}"
+            kdialog --title "$title" --getopenfilename "$PWD" "$f" \
+                --multiple --separate-output 2>/dev/null || true ;;
+        *)
+            printf 'lockd: no file picker in terminal mode - pass paths as arguments\n' >&2
+            return 0 ;;
+    esac
+}
+
+dlg_list() {  # $1 title; rest = tag label pairs -> chosen tag on stdout
+    dlg_backend
+    local title="$1"; shift
+    local -a args=()
+    case "$DLG" in
+        yad)
+            args=(--list --hide-column=1 --column="id" --column="option"
+                  --print-column=1 --width=520 --height=280)
+            while (( $# )); do args+=("$1" "$2"); shift 2; done
+            yad --title="$title" --borders=12 "${args[@]}" 2>/dev/null | cut -d'|' -f1 || true ;;
+        zenity)
+            args=(--list --hide-column=1 --column="id" --column="option" --print-column=1)
+            while (( $# )); do args+=("$1" "$2"); shift 2; done
+            zenity --title="$title" "${args[@]}" 2>/dev/null || true ;;
+        kdialog)
+            args=()
+            while (( $# )); do args+=("$1" "$2"); shift 2; done
+            kdialog --title "$title" --menu "$title" "${args[@]}" 2>/dev/null || true ;;
+        tty)
+            local -A map=() n=1
+            while (( $# )); do
+                printf '  %d) %s\n' "$n" "$2" >&2
+                map[$n]="$1"; n=$((n+1)); shift 2
+            done
+            local a; read -r -p "#? " a || return 0
+            [[ -n "${map[$a]:-}" ]] && printf '%s\n' "${map[$a]}"
+            return 0 ;;
+    esac
+}
 
 identity_path() {
     # config override -> stock lockd path. Also scanned for adoption:
@@ -78,15 +238,14 @@ config_set() {
 # Returns 0 and echoes the temp plaintext-identity path on success.
 unlock_identity() {
     local pw wdir tmpid
-    wdir=$(mktemp -d /tmp/lockd-id.XXXXXX)
+    wdir=$(mktemp -d "${TMPDIR:-/tmp}/lockd-id.XXXXXX")
     tmpid="$wdir/id"                       # must NOT exist: age refuses -o over
     chmod 600 "$tmpid" 2>/dev/null || true
-    pw=$(yad_form \
-        --field="Unlock key passphrase:":H \
-        --field="  (confirm):":H \
-        --field="No other options going forward:":CHK) || die "cancelled"
-    local upw cpw chk
-    IFS='|' read -r upw cpw chk <<<"$pw"
+    local out
+    out=$(dlg_form) || { rm -rf "$wdir"; die "cancelled"; }
+    local f upw cpw chk
+    mapfile -t f <<<"$out"
+    upw="${f[0]:-}"; cpw="${f[1]:-}"; chk="${f[2]:-FALSE}"
     [[ "$upw" == "$cpw" ]] || { shred -uzn1 "$tmpid" 2>/dev/null; rm -rf "$wdir"; die "passphrases do not match"; }
     [[ -n "$upw" ]] || { shred -uzn1 "$tmpid" 2>/dev/null; rm -rf "$wdir"; die "empty passphrase"; }
     if [[ "$chk" == TRUE ]]; then config_set fast_path 1; fi
@@ -114,28 +273,26 @@ ensure_key() {
     # secrets around); standard spots first.
     for spot in "${STANDARD_KEY_SPOTS[@]}"; do
         if [[ -f "$spot" ]]; then
-            if yad_q "Found an existing age key:\n${spot}\n\nAdopt it as your lockd default? (referenced, not copied)"; then
+            if dlg_q "Found an existing age key:\n${spot}\n\nAdopt it as your lockd default? (referenced, not copied)"; then
                 config_set identity_path "$spot"
                 say "adopted: $spot"
                 return 0
             fi
         fi
     done
-    yad_q "No default AGE key found.\n(gpg keys are a different system - they do not apply here.)\n\nCreate one now? It becomes your lockd default.\nLives at: ${IDENTITY}" \
+    dlg_q "No default AGE key found.\n(gpg keys are a different system - they do not apply here.)\n\nCreate one now? It becomes your lockd default.\nLives at: ${IDENTITY}" \
         || die "no key, no lock"
-    local pw
-    pw=$(yad_form \
-        --field="New key passphrase:":H \
-        --field="  (confirm):":H \
-        --field="No other options going forward:":CHK) || die "cancelled"
-    local npw cpw chk
-    IFS='|' read -r npw cpw chk <<<"$pw"
+    local out
+    out=$(dlg_form) || die "cancelled"
+    local f npw cpw chk
+    mapfile -t f <<<"$out"
+    npw="${f[0]:-}"; cpw="${f[1]:-}"; chk="${f[2]:-FALSE}"
     [[ -n "$npw" ]] || die "empty passphrase"
     [[ "$npw" == "$cpw" ]] || die "passphrases do not match"
     if [[ "$chk" == TRUE ]]; then config_set fast_path 1; fi
     mkdir -p "$CONFIG_DIR"
     local id; id=$(identity_path)
-    local wdir; wdir=$(mktemp -d /tmp/lockd-birth.XXXXXX)
+    local wdir; wdir=$(mktemp -d "${TMPDIR:-/tmp}/lockd-birth.XXXXXX")
     local plain; plain="$wdir/plain"       # non-existent: age writes fresh
     age-keygen -o "$plain" >/dev/null 2>&1 || { rm -rf "$wdir"; die "keygen failed"; }
     # BUG FIX 2026-09-03: the first version ran 'age -p -o ID' with NO input
@@ -173,18 +330,54 @@ lockd — lazy, kind encryption (age underneath)
   lockd -k|--keep           encrypt but never wipe the originals
   lockd -f|--fast           this run: no send/extra offers
   lockd --full              this run: offers even if fast-path is saved
-  lockd --selftest          crypto roundtrip + wipe semantics, headless
+  lockd --selftest          crypto roundtrip + backend/clipboard checks, headless
 
 Wipe rule: originals are shredded BY DEFAULT, but only after the
 ciphertext verifies byte-for-byte. If verification fails, the original
 survives and lockd says so. "No other options going forward" on the
 password window saves the fast path permanently.
+
+Any desktop, or none:
+  $LOCKD_DIALOG   force a dialog backend: yad, zenity, kdialog, or tty.
+                  default: yad -> zenity -> kdialog -> terminal.
+                  terminal mode reads stdin, so lockd works over ssh too.
+  $LOCKD_MAILER   mailer for the "email it" offer (else xdg-email, then
+                  claws-mail). attachments via --attach.
+EOF
+}
+
+print_ctx_script() {  # right-click script for the nautilus/caja/nemo family
+    # one body, three managers: they all speak the nautilus script protocol
+    # (selection in *_SCRIPT_SELECTED_FILE_PATHS, newline-separated). the
+    # installer drops it under each manager's scripts dir; selftest proves
+    # the env -> argv plumbing (spaces included) with a stub lockd.
+    local kind="$1" exec_line
+    case "$kind" in
+        encrypt) exec_line="lockd" ;;
+        decrypt) exec_line="lockd -d --open" ;;
+        shred)   exec_line="lockd --shred" ;;
+        *) return 1 ;;
+    esac
+    cat <<EOF
+#!/bin/sh
+# lockd — $kind (nautilus / caja / nemo right-click)
+sel="\${NEMO_SCRIPT_SELECTED_FILE_PATHS:-\${CAJA_SCRIPT_SELECTED_FILE_PATHS:-\${NAUTILUS_SCRIPT_SELECTED_FILE_PATHS:-}}}"
+while IFS= read -r f; do
+    [ -n "\$f" ] && set -- "\$@" "\$f"
+done <<LOCKD_PATHS
+\$sel
+LOCKD_PATHS
+exec $exec_line "\$@"
 EOF
 }
 
 do_selftest() {
-    local t; t=$(mktemp -d /tmp/lockd-selftest.XXXXXX)
-    trap "shred -uzn1 '$t'/* 2>/dev/null; rm -rf '$t'" EXIT
+    local t; t=$(mktemp -d "${TMPDIR:-/tmp}/lockd-selftest.XXXXXX")
+    # set +e: the trap runs under errexit, and shred errors on any
+    # directory in its path - without it the trap dies mid-way, rm -rf
+    # never runs, and the failure code REPLACES the test result (this
+    # shipped once: PASS on screen, rc=1 to callers, dir leaked)
+    trap "set +e; find '$t' -type f -exec shred -uzn1 {} + 2>/dev/null; rm -rf '$t'" EXIT
     printf 'lockd selftest payload %s\n' "$(date)" > "$t/plain.txt"
     # identity for the test (unencrypted temp; no passphrase machinery)
     AGE_IDENTITY="$t/testkey.txt" age-keygen -o "$t/testkey.txt" >/dev/null 2>&1
@@ -210,13 +403,132 @@ do_selftest() {
     tar -xzf "$t/dirverify.tar.gz" -C "$t/x"
     diff -r -q --no-dereference "$t/dir" "$t/x/dir" >/dev/null \
         || { echo "FAIL: directory roundtrip mismatch"; return 1; }
-    echo "selftest: PASS (file + directory roundtrips, wipe semantics)"
+
+    # --- backend walk: override honored, bad override falls back, no
+    # dialog binaries -> tty (bash-only PATH), real backends detectable
+    local b
+    b=$(LOCKD_DIALOG=tty "$0" --print-backend) && [[ "$b" == "tty" ]] \
+        || { echo "FAIL: LOCKD_DIALOG=tty not honored"; return 1; }
+    b=$(LOCKD_DIALOG=definitely-not-real-"$$" "$0" --print-backend 2>/dev/null) && [[ "$b" == "tty" ]] \
+        || { echo "FAIL: bad override should fall back to tty"; return 1; }
+    mkdir -p "$t/bin" && ln -sf "$(command -v bash)" "$t/bin/bash"
+    b=$(PATH="$t/bin" "$0" --print-backend) && [[ "$b" == "tty" ]] \
+        || { echo "FAIL: no dialog binaries should mean tty"; return 1; }
+    if command -v yad >/dev/null 2>&1; then
+        b=$(LOCKD_DIALOG=yad "$0" --print-backend) && [[ "$b" == "yad" ]] \
+            || { echo "FAIL: LOCKD_DIALOG=yad not honored"; return 1; }
+    fi
+    if command -v zenity >/dev/null 2>&1; then
+        b=$(LOCKD_DIALOG=zenity "$0" --print-backend) && [[ "$b" == "zenity" ]] \
+            || { echo "FAIL: LOCKD_DIALOG=zenity not honored"; return 1; }
+    fi
+
+    # --- clipboard chain: present-but-failing helper falls through to
+    # the next one (stub wl-copy exits 1, stub xclip captures stdin)
+    mkdir -p "$t/stub"
+    printf '#!/bin/sh\nexit 1\n' > "$t/stub/wl-copy"
+    printf '#!/bin/sh\ncat > "$LOCKD_STUB_OUT"\n' > "$t/stub/xclip"
+    chmod +x "$t/stub/wl-copy" "$t/stub/xclip"
+    ( export PATH="$t/stub:$PATH" LOCKD_STUB_OUT="$t/clip.out"
+      printf 'clip-payload' | clip_copy ) || { echo "FAIL: clipboard chain fell through"; return 1; }
+    grep -q "clip-payload" "$t/clip.out" || { echo "FAIL: clipboard payload lost"; return 1; }
+    rm -f "$t/stub/xclip"
+    mkdir -p "$t/stub2" && ln -sf "$(command -v bash)" "$t/stub2/bash"
+    mv -f "$t/stub/wl-copy" "$t/stub2/wl-copy" 2>/dev/null || true
+    ( export PATH="$t/stub2"; printf 'x' | clip_copy ) 2>/dev/null \
+        && { echo "FAIL: dead clipboard chain should fail"; return 1; } || true
+
+    # --- right-click scripts: env -> argv plumbing (spaces intact) via
+    # a stub lockd on PATH
+    mkdir -p "$t/bin2"
+    cat > "$t/bin2/lockd" <<'STUB'
+#!/bin/sh
+printf '%s\n' "$@" > "$LOCKD_CTX_OUT"
+STUB
+    chmod +x "$t/bin2/lockd"
+    "$0" --ctx-script encrypt > "$t/ctx.sh"
+    ( export PATH="$t/bin2:$PATH" LOCKD_CTX_OUT="$t/ctx.out"
+      export NAUTILUS_SCRIPT_SELECTED_FILE_PATHS="$t/a file.txt"$'\n'"$t/b.txt"
+      sh "$t/ctx.sh" )
+    grep -qxF "$t/a file.txt" "$t/ctx.out" && grep -qxF "$t/b.txt" "$t/ctx.out" \
+        || { echo "FAIL: ctx script mangled paths"; return 1; }
+    "$0" --ctx-script decrypt | grep -q "lockd -d --open" \
+        || { echo "FAIL: decrypt ctx script wrong"; return 1; }
+
+    # --- no residue, ever + WILL decrypt: the REAL flow (key birth,
+    # encrypt, verify-wipe, decrypt) in an isolated HOME+TMPDIR. The
+    # trap-cleaned temp identity must leave TMPDIR empty, and the payload
+    # must come back byte-perfect. (running "$0" as its own process: its
+    # traps fire in ITS lifetime, exactly like a real user run)
+    mkdir -p "$t/iso" "$t/isotmp"
+    ( export HOME="$t/iso" TMPDIR="$t/isotmp" LOCKD_DIALOG=tty
+      printf 'residue payload\n' > "$t/iso/doc.txt"
+      printf 'y\nselfpw\nselfpw\ny\nselfpw\nselfpw\ny\n' | "$0" "$t/iso/doc.txt" >/dev/null 2>&1
+      printf 'selfpw\nselfpw\nn\n' | "$0" -d "$t/iso/doc.txt.age" >/dev/null 2>&1
+    )
+    grep -q "residue payload" "$t/iso/doc.txt" \
+        || { echo "FAIL: flow did not decrypt the payload back"; return 1; }
+    [[ -f "$t/iso/doc.txt.age" ]] \
+        || { echo "FAIL: .age missing (user declined source-shred - it must stay)"; return 1; }
+    local res; res=$(ls -A "$t/isotmp" 2>/dev/null | wc -l)
+    [[ "$res" -eq 0 ]] \
+        || { echo "FAIL: residue left behind: $(ls -A "$t/isotmp" | tr '\n' ' ')"; return 1; }
+
+    echo "selftest: PASS (file + directory roundtrips, wipe semantics, backend walk, clipboard chain, ctx scripts, real-flow decrypt + zero residue)"
 }
 
-pick_files() {
-    need yad
-    yad --title="lockd — pick what to encrypt" --borders=12 \
-        --file-selection --multiple --separator='\n' --width=720 2>/dev/null || true
+pick_files() {  # -> paths on stdout (empty on cancel)
+    dlg_pick "lockd — pick what to encrypt"
+}
+
+clip_copy() {  # stdin -> system clipboard; wayland, x11, then xsel
+    # stdio goes to /dev/null: xclip forks a daemon to hold the selection,
+    # and a daemon holding our stdout is a hang waiting to happen
+    local c
+    for c in wl-copy xclip xsel; do
+        command -v "$c" >/dev/null 2>&1 || continue
+        case "$c" in
+            wl-copy) wl-copy >/dev/null 2>&1 && return 0 ;;
+            xclip)   xclip -selection clipboard >/dev/null 2>&1 && return 0 ;;
+            xsel)    xsel --clipboard --input >/dev/null 2>&1 && return 0 ;;
+        esac
+    done
+    return 1
+}
+
+mail_attach() {  # attach files: $LOCKD_MAILER -> xdg-email -> claws-mail
+    (( $# > 0 )) || return 1
+    local -a cmd=()
+    if [[ -n "${LOCKD_MAILER:-}" ]]; then
+        command -v "$LOCKD_MAILER" >/dev/null 2>&1 \
+            || { say "LOCKD_MAILER=$LOCKD_MAILER not installed"; return 1; }
+        cmd=("$LOCKD_MAILER")
+    elif command -v xdg-email >/dev/null 2>&1; then cmd=(xdg-email)
+    elif command -v claws-mail >/dev/null 2>&1; then cmd=(claws-mail)
+    else return 1; fi
+    local f
+    for f in "$@"; do cmd+=("--attach=$f"); done
+    "${cmd[@]}" >/dev/null 2>&1 & disown || true
+    say "mail draft opened with $# encrypted file(s) attached (${cmd[0]})"
+}
+
+places_list() {  # -> deduped bookmark dirs: GTK bookmarks + KDE user-places.xbel
+    local f p
+    {   f="${HOME}/.config/gtk-3.0/bookmarks"
+        [[ -f "$f" ]] && while IFS= read -r p; do
+            p="${p#file://}"; p="${p%% *}"; p="${p//%20/ }"
+            [[ -d "$p" ]] && printf '%s\n' "$p"
+        done < "$f"
+        # Dolphin/Plasma places are an XBEL file; hrefs are file:// URLs.
+        # (decode is intentionally rough: %20 only - spaces cover real bookmarks)
+        f="${HOME}/.local/share/user-places.xbel"
+        if [[ -f "$f" ]]; then
+            while IFS= read -r p; do
+                p="${p#file://}"; p="${p//%20/ }"
+                [[ -d "$p" ]] && printf '%s\n' "$p"
+            done < <(grep -o 'href="[^"]*"' "$f" | sed 's/^href="//; s/"$//')
+        fi
+    } | awk '!seen[$0]++'
 }
 
 send_offers() {
@@ -224,29 +536,32 @@ send_offers() {
     [[ $(config_get fast_path) == "1" ]] && return 0
     local pub="$1"; shift
     local choice
-    choice=$(yad --title="lockd — what now?" --borders=12 --list --hide-column=1 \
-        --column="id" --column="option" --print-column=1 --width=520 --height=280 \
-        "pub"    "Copy public key to clipboard" \
-        "email"  "Email the encrypted file(s) (claws-mail)" \
-        "place"  "Copy to a Place (your bookmarks)" \
-        "done"   "Done" 2>/dev/null | cut -d'|' -f1) || choice="done"
+    choice=$(dlg_list "lockd — what now?" \
+        pub    "Copy public key to clipboard" \
+        email  "Email the encrypted file(s)" \
+        place  "Copy to a Place (your bookmarks)" \
+        done   "Done") || choice=""
     case "$choice" in
         pub)
-            printf '%s' "$pub" | xclip -selection clipboard \
-                && say "public key copied to clipboard" ;;
+            if printf '%s' "$pub" | clip_copy; then
+                say "public key copied to clipboard"
+            else
+                dlg_err "no clipboard helper found (wl-copy / xclip / xsel)\nYour public key:\n$pub"
+                say "no clipboard helper - public key:\n$pub"
+            fi ;;
         email)
-            local args="" f
-            for f in "$@"; do args+=" --attach=$(printf %q "$f")"; done
-            claws-mail $args >/dev/null 2>&1 & disown || true
-            say "claws-mail opened with the encrypted file(s) attached" ;;
+            mail_attach "$@" || { dlg_err "no mailer found\n(set \$LOCKD_MAILER, or install xdg-email / claws-mail)"; say "no mailer found"; } ;;
         place)
-            [[ -f "$BOOKMARKS" ]] || { say "no bookmarks (places) found"; break 2>/dev/null || true; return 0; }
-            local places pick
-            places=$(sed 's|^file://||; s| .*$||' "$BOOKMARKS" | grep -v '^$')
-            pick=$(yad --title="lockd — pick a Place" --borders=12 --list --hide-column=1 \
-                --column="path" --column="Place" --print-column=1 --width=560 --height=360 \
-                $(while read -r p; do printf '%q %q\n' "$p" "$(basename "$p")"; done <<<"$places") \
-                2>/dev/null | cut -d'|' -f1) || pick=""
+            local -a places=()
+            mapfile -t places < <(places_list)
+            if (( ${#places[@]} == 0 )); then
+                say "no bookmarks (places) found"
+                return 0
+            fi
+            local -a pargs=() pl
+            for pl in "${places[@]}"; do pargs+=("$pl" "$(basename "$pl")"); done
+            local pick
+            pick=$(dlg_list "lockd — pick a Place" "${pargs[@]}") || pick=""
             if [[ -n "$pick" && -d "$pick" ]]; then
                 local f
                 for f in "$@"; do cp -v "$f" "$pick/"; done
@@ -255,12 +570,19 @@ send_offers() {
     esac
 }
 
+cleanup_ids() {  # shred the unlocked temp identity + remove its workdir
+    [[ -n "${TMPID:-}" ]] || return 0
+    shred -uzn1 "$TMPID" 2>/dev/null || true
+    rmdir "$(dirname "$TMPID")" 2>/dev/null || true
+    TMPID=""
+}
+
 do_encrypt() {
-    need age; need age-keygen; need xclip
+    need age; need age-keygen
     ensure_key
-    local tmpid; tmpid=$(unlock_identity)
-    trap 'shred -uzn1 "$tmpid" 2>/dev/null; [[ -n "${VFDIR:-}" ]] && rm -rf "${VFDIR}"; [[ -n "${STAGE:-}" ]] && rm -rf "${STAGE}"; VFDIR=""; STAGE=""' EXIT
-    local pub; pub=$(age-keygen -y "$tmpid")
+    TMPID=$(unlock_identity)
+    trap 'cleanup_ids; [[ -n "${VFDIR:-}" ]] && rm -rf "${VFDIR}"; [[ -n "${STAGE:-}" ]] && rm -rf "${STAGE}"; VFDIR=""; STAGE=""' EXIT
+    local pub; pub=$(age-keygen -y "$TMPID")
 
     local paths=("$@")
     if (( ${#paths[@]} == 0 )); then
@@ -280,7 +602,7 @@ do_encrypt() {
             out="${p}.age"
             age -r "$pub" -o "$out" "$p"
         fi
-        [[ -s "$out" ]] || { yad_err "encryption produced nothing: $out"; return 1; }
+        [[ -s "$out" ]] || { dlg_err "encryption produced nothing: $out"; return 1; }
         # verify-then-shred: the wipe rule can never lie. Files byte-compare;
         # directories unpack the archive and diff the whole tree (a tar.gz
         # can never byte-compare against a directory - BUG FIX 2026-09-04:
@@ -297,7 +619,7 @@ do_encrypt() {
         sz=$(du -sb "$p" 2>/dev/null | cut -f1); sz=${sz:-0}
         room=$(df -B1 --output=avail "$(dirname "$out")" 2>/dev/null | tail -1 | tr -d ' ')
         if [[ -n "$room" && "$sz" -gt 0 ]] && (( room < sz * 3 + 104857600 )); then
-            yad_err "Not enough free space beside the target to verify safely.\nNeed ~$(( sz * 3 / 1073741824 + 1 ))GB, have $(( room / 1073741824 ))GB on $(dirname "$out").\nNothing was encrypted. Free up space and run lockd again."
+            dlg_err "Not enough free space beside the target to verify safely.\nNeed ~$(( sz * 3 / 1073741824 + 1 ))GB, have $(( room / 1073741824 ))GB on $(dirname "$out").\nNothing was encrypted. Free up space and run lockd again."
             say "verify space short for $p - nothing encrypted"
             continue
         fi
@@ -305,7 +627,7 @@ do_encrypt() {
         VFDIR="$vdir"
         local vcmp; vcmp="$vdir/verify"        # non-existent: age writes fresh
         local ok=0
-        if age -d -i "$tmpid" -o "$vcmp" "$out" 2>/dev/null; then
+        if age -d -i "$TMPID" -o "$vcmp" "$out" 2>/dev/null; then
             if [[ -d "$p" ]]; then
                 local vext="$vdir/extract"
                 mkdir -p "$vext"
@@ -319,6 +641,8 @@ do_encrypt() {
         if [[ $ok -eq 1 ]]; then
             if [[ $KEEP -eq 1 ]]; then
                 say "verified: $out (original kept: --keep)"
+                # GUI runs have no stdout - say it where the user is
+                notify "original kept (--keep): $(basename "$p")"
             elif [[ -d "$p" ]]; then
                 # recursive wipe: shred every regular file, then remove the
                 # tree (shred itself refuses directories)
@@ -331,7 +655,7 @@ do_encrypt() {
             fi
         else
             rm -rf "$vdir"; VFDIR=""; shred -uzn1 "$out" 2>/dev/null || true
-            yad_err "VERIFICATION FAILED for $p\nThe original was KEPT and the bad ciphertext was destroyed.\nNothing was lost. That is the rule."
+            dlg_err "VERIFICATION FAILED for $p\nThe original was KEPT and the bad ciphertext was destroyed.\nNothing was lost. That is the rule."
             say "VERIFICATION FAILED: $p kept, bad ciphertext destroyed"
             continue
         fi
@@ -356,12 +680,10 @@ do_shred() {
     # the wipe rule's machinery, standing alone: secure-wipe any file
     local paths=("$@")
     if (( ${#paths[@]} == 0 )); then
-        need yad
-        mapfile -t paths < <(yad --title="lockd — pick file(s) to wipe" --borders=12 \
-            --file-selection --multiple --separator='\n' --width=720 2>/dev/null || true)
+        mapfile -t paths < <(dlg_pick "lockd — pick file(s) to wipe")
         (( ${#paths[@]} > 0 )) || die "nothing picked"
     fi
-    yad_q "Securely wipe ${#paths[@]} item(s)?\nThis cannot be undone." || die "cancelled"
+    dlg_q "Securely wipe ${#paths[@]} item(s)?\nThis cannot be undone." || die "cancelled"
     local p
     for p in "${paths[@]}"; do
         if [[ -f "$p" ]]; then
@@ -375,14 +697,11 @@ do_shred() {
 do_decrypt() {
     need age; need age-keygen
     [[ -f "$(identity_path)" ]] || die "no default key to unlock"
-    local tmpid; tmpid=$(unlock_identity)
-    trap 'shred -uzn1 "$tmpid" 2>/dev/null; [[ -n "${VFDIR:-}" ]] && rm -rf "${VFDIR}"; [[ -n "${STAGE:-}" ]] && rm -rf "${STAGE}"; VFDIR=""; STAGE=""' EXIT
+    TMPID=$(unlock_identity)
+    trap 'cleanup_ids; [[ -n "${VFDIR:-}" ]] && rm -rf "${VFDIR}"; [[ -n "${STAGE:-}" ]] && rm -rf "${STAGE}"; VFDIR=""; STAGE=""' EXIT
     local paths=("$@")
     if (( ${#paths[@]} == 0 )); then
-        need yad
-        mapfile -t paths < <(yad --title="lockd — pick .age to decrypt" --borders=12 \
-            --file-selection --multiple --separator='\n' --width=720 \
-            --file-filter="age files | *.age" 2>/dev/null || true)
+        mapfile -t paths < <(dlg_pick "lockd — pick .age to decrypt" "age files | *.age")
         (( ${#paths[@]} > 0 )) || die "nothing picked"
     fi
     local p out
@@ -397,13 +716,13 @@ do_decrypt() {
             asz=$(stat -c %s "$p" 2>/dev/null || echo 0)
             room=$(df -B1 --output=avail "$(dirname "$p")" 2>/dev/null | tail -1 | tr -d ' ')
             if [[ -n "$room" ]] && (( asz > 0 && room < asz * 3 + 104857600 )); then
-                yad_err "Not enough free space beside $p to restore the tree.\nNeed ~$(( asz * 3 / 1073741824 + 1 ))GB, have $(( room / 1073741824 ))GB. Nothing was changed."
+                dlg_err "Not enough free space beside $p to restore the tree.\nNeed ~$(( asz * 3 / 1073741824 + 1 ))GB, have $(( room / 1073741824 ))GB. Nothing was changed."
                 continue
             fi
             stage=$(mktemp -d "$(dirname "$p")/.lockd-ex.XXXXXX")
             STAGE="$stage"
-            if ! age -d -i "$tmpid" "$p" 2>/dev/null | tar -xzf - -C "$stage"; then
-                yad_err "Restore failed - archive may be corrupt or extraction ran out of space.\nThe .age source is untouched. Partial output removed."
+            if ! age -d -i "$TMPID" "$p" 2>/dev/null | tar -xzf - -C "$stage"; then
+                dlg_err "Restore failed - archive may be corrupt or extraction ran out of space.\nThe .age source is untouched. Partial output removed."
                 rm -rf "$stage"; STAGE=""
                 continue
             fi
@@ -433,7 +752,7 @@ do_decrypt() {
             *.age) out="${p%.age}" ;;
             *)     out="${p}.decrypted" ;;
         esac
-        age -d -i "$tmpid" -o "$out" "$p"
+        age -d -i "$TMPID" -o "$out" "$p"
         RESTORED="$out"
         say "decrypted: $p  ->  $out"
     done
@@ -443,7 +762,7 @@ do_decrypt() {
             xdg-open "$RESTORED" >/dev/null 2>&1 & disown
         fi
     fi
-    if yad_q "Shred the source .age file(s) now?\n(the decrypted output stays, of course)"; then
+    if dlg_q "Shred the source .age file(s) now?\n(the decrypted output stays, of course)"; then
         for p in "${paths[@]}"; do [[ -f "$p" ]] && shred -uzn1 "$p" && say "wiped: $p"; done
     fi
 }
@@ -459,6 +778,12 @@ main() {
             --open)       OPEN=1 ;;
             --shred)     SHRED_MODE=1 ;;
             --selftest)  do_selftest; exit $? ;;
+            --print-backend) dlg_backend; printf '%s\n' "$DLG"; exit 0 ;;
+            --ctx-script)
+                shift
+                print_ctx_script "${1:-}" \
+                    || { printf 'lockd: --ctx-script needs encrypt|decrypt|shred\n' >&2; exit 1; }
+                exit 0 ;;
             -h|--help)   usage; exit 0 ;;
             -*)          die "unknown flag: $1 (see --help)" ;;
             *)           args+=("$1") ;;

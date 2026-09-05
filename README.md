@@ -1,7 +1,7 @@
 # lockd — lazy, kind encryption
 
 
-Command line: $ lock (whatever), handy right-click in Thunar, or keybind: c'tarl+alt+E. `age` does the cryptography
+Command line: $ lock (whatever), handy right-click in your file manager, or keybind: Ctrl+Alt+E. `age` does the cryptography
 (Debian-packaged, MIT, modern); lockd does the *everything else* — people don't encrypt because 'complicated'. Nah.
 
 [![lockd command line — click to play](cmdlnlockd_t35.jpg)](https://github.com/user-attachments/assets/43247bdc-fa3a-42a3-826e-e79db5341cc5)
@@ -12,14 +12,14 @@ lockd somedir                → the directory becomes one archive, locked
 lockd -d thing.age           → unlock it
 lockd --keep                 → encrypt but never wipe the originals
 lockd --fast                 → this run: no offers, just lock it
-lockd --selftest             → prove the roundtrip, headless
+lockd --selftest             → prove the roundtrip + the plumbing, headless
 ```
 
-And some handy aliases to **.bash_aliases**:
+The installer adds these aliases to **.bash_aliases** (guarded, yours win):
 
-- alias lock='lockd %F'
-- alias unlock='lockd -d %F'
-- alias erase='lockd --shred %F'
+- alias lock='lockd'
+- alias unlock='lockd -d'
+- alias erase='lockd --shred'
 
 
 ## THE RULE
@@ -49,17 +49,61 @@ to a Place of your choosing.
 
 The password window carries a checkbox: **"No other options going forward"**.
 Check it once and lockd's offers go away forever — encrypt, verify, wipe,
-done. (`lockd --full` brings the offers back for one run.)
+done. (`lockd --full` brings the offers back for one run.) zenity and
+kdialog have no checkbox widget — there the choice is asked **once**, then
+the window is one shot: credentials, enter, done.
 
 ## Places
 
-The "what now?" offers read your GTK bookmarks (`Places` in Thunar) — copy
-the locked file to any of them with one pick, or hand it to claws-mail.
+The "what now?" offers read your bookmarks — GTK bookmarks (`Places` in
+Thunar) and KDE's `user-places.xbel` — copy the locked file to any of them
+with one pick, or hand it to your mail client.
+
+## Any desktop, or none
+
+lockd is not married to a desktop. Every window and menu goes through a
+backend chain, resolved once per run:
+
+- **dialogs**: `$LOCKD_DIALOG` (override) → `yad` → `zenity` → `kdialog` → plain terminal
+- **clipboard**: `wl-copy` → `xclip` → `xsel`
+- **mailer**: `$LOCKD_MAILER` (override) → `xdg-email` → `claws-mail`
+- **right-click**: Thunar, Nautilus, Caja, Nemo (Scripts menu) and Dolphin (service menu) — the installer drops only what your desktop actually uses
+- **menu + double-click**: `.desktop` entries with a bundled icon — freedesktop standard, works everywhere
+
+The terminal fallback is real, not a consolation prize: `lockd` over SSH
+asks for the passphrase right on the command line and the whole flow —
+key birth included — works with zero GUI installed.
+
+```
+LOCKD_DIALOG=tty lockd file.txt      # force terminal mode on a GUI box
+LOCKD_DIALOG=zenity lockd file.txt   # force zenity instead of yad
+LOCKD_MAILER=mutt lockd file.txt     # hand the offer to a different mailer
+```
+
+## Keybind (Ctrl+Alt+E)
+
+The installer sets **Ctrl+Alt+E** on openbox, XFCE (xfconf) and GNOME
+(gsettings) — always guarded: if you already use that combo, lockd leaves
+it alone. i3/sway users, one line each:
+
+```
+# i3 (~/.config/i3/config)
+bindsym $mod+Ctrl+e exec --no-startup-id ~/.local/bin/lockd
+
+# sway (~/.config/sway/config)
+bindsym $mod+Ctrl+e exec ~/.local/bin/lockd
+```
+
+KDE: System Settings → Shortcuts → add Custom Shortcut → command
+`~/.local/bin/lockd`, trigger Ctrl+Alt+E.
 
 ## Requirements
 
-Stock Debian: `age` (apt), `yad`, `xclip`, `script`, `shred` — all in the
-repos, nothing exotic, nothing compiled.
+`age`, `shred`, `script` — hard requirements, in every distro's repos.
+Everything else is soft and the installer says what it found: a dialog
+tool (`yad`/`zenity`/`kdialog`), a clipboard helper (`wl-clipboard`/
+`xclip`/`xsel`), `libnotify` for the notifications. Missing the soft
+stuff just means lockd skips that offer — or runs in terminal mode.
 
 ## Phase 2 (parked on purpose)
 
@@ -69,7 +113,7 @@ the `.age`, and the mailbox becomes a backup the provider cannot read
 **signing** is a different animal: age keys cannot sign — that's
 deliberate in age's design — so signing stays with OpenPGP/gpg in your
 mail client, where it already works. Plus: contact-card (vcf) key
-sharing, keybind (the installer sets **Ctrl+Alt+E** on openbox). The name: yes, the kernel's NFS `lockd` owns that
+sharing. The name: yes, the kernel's NFS `lockd` owns that
 string in some contexts — accepted; nothing collides at the binary
 level. And in george, lockd is a chip: one line in `buttons.toml`.
 
