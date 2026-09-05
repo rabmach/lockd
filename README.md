@@ -22,6 +22,19 @@ The installer adds these aliases to **.bash_aliases** (guarded, yours win):
 - alias erase='lockd --shred'
 
 
+## Real-world usage
+
+```
+touch rambler1.txt && lockd rambler1.txt
+lock *.jpg receipt.pdf
+lock taxes/                           # -> taxes.tar.gz.age
+unlock rambler1.txt.age
+unlock taxes.tar.gz.age --open        # decrypted result opened for you
+lock --keep rambler1.txt              # original survives, verification still runs
+erase old-notes.txt                   # just shred, no crypto
+```
+
+
 ## THE RULE
 
 **The original is wiped by default.**
