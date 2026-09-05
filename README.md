@@ -18,8 +18,7 @@ lockd --selftest             → prove the roundtrip, headless
 
 ## THE RULE
 
-**The original is wiped by default.** The literature says so; the code keeps
-the promise — but the wipe can never lie:
+**The original is wiped by default.**
 
 1. lockd encrypts.
 2. lockd decrypts the ciphertext back and byte-compares it against the
