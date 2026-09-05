@@ -331,6 +331,39 @@ corrupt files. The selftest re-proves the roundtrip at wiring time, and
 the format has independent implementations (rage and others), so the
 "WILL decrypt" promise has insurance beyond any one distro.
 
+## The Desktop backup and the one notice (2026-09-05)
+
+The cuppa question that forced this into being: *"if I cp my key file to a
+dump and copy it back into a fresh install, will filemarkers — dates,
+modified times, permissions — disturb the process?"*
+
+**The answer is no, and now it is machine-checked.** The identity file is
+an age passphrase-encrypted byte blob; age decrypts bytes and nothing else.
+A copy with a 1999 mtime and 777 permissions decrypts exactly like the
+original. lockd additionally self-heals the real key's permissions on
+every run (dir 700, identity 600), so a rough copy-back is tidied without
+anyone asking.
+
+**What shipped:** key birth now drops a dated tarball on the Desktop —
+`lockd-key-YYYY-MM-DD.tar.gz`, never overwriting an earlier backup — and
+the user is told exactly once, in the words they need: *safeguard it (and
+the passphrase) now*. The notice is one delayed `notify-send` (6 seconds
+in, 10 seconds up), backgrounded so the flow never waits on it; terminal
+and SSH births get the same words on stdout. Headless boxes with no
+Desktop get an honest skip line, and a failed backup can never fail the
+birth — the key exists and is verified regardless.
+
+**The honest hierarchy of what can be lost:** the identity file (now
+backed up at birth, user's job to safeguard), and the passphrase (no
+reset, no escrow — by design, and the notice says so). Ciphertexts bind
+to the key that made them: a fresh install's new key opens nothing old;
+the restored backup opens everything.
+
+**No README section, no `--backup` flag, no reminders.** The people who
+reach for encryption already know they are wearing a purple shirt. The
+selftest carries the proof instead: backup → destroy → restore → decrypt,
+then restore with hostile metadata → still decrypts — forever.
+
 ## Environment variables
 
 | Variable | Meaning | Default |

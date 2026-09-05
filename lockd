@@ -260,6 +260,38 @@ unlock_identity() {
     printf '%s' "$tmpid"
 }
 
+desktop_dir() {  # the DE's real Desktop (localized), else ~/Desktop. rc 1 = none
+    local f="$HOME/.config/user-dirs.dirs" d=""
+    if [[ -r "$f" ]]; then
+        d=$(source "$f" 2>/dev/null; printf '%s' "${XDG_DESKTOP_DIR:-}")
+    fi
+    [[ -n "$d" && -d "$d" ]] && { printf '%s\n' "$d"; return 0; }
+    [[ -d "$HOME/Desktop" ]] && { printf '%s\n' "$HOME/Desktop"; return 0; }
+    return 1
+}
+
+backup_key_to_desktop() {  # $1 = identity file -> tarball path on stdout
+    # One-time safeguard at key birth: the wrapped identity lands on the
+    # Desktop as a dated tarball. Ciphertext is shareable by design (the
+    # passphrase is the secret), but 600 costs nothing. Human lines go to
+    # STDERR so command substitution only ever captures the path.
+    local id="$1" d out n=1
+    d=$(desktop_dir) \
+        || { printf '%s\n' "no Desktop dir found - safeguard the key file itself: $id" >&2; return 1; }
+    out="$d/lockd-key-$(date +%F).tar.gz"
+    while [[ -e "$out" ]]; do          # never overwrite an earlier backup
+        n=$((n + 1)); out="$d/lockd-key-$(date +%F)-$n.tar.gz"
+    done
+    if tar -czf "$out" -C "$(dirname "$id")" "$(basename "$id")" 2>/dev/null; then
+        chmod 600 "$out" 2>/dev/null || true
+        printf '%s\n' "$out"
+        return 0
+    fi
+    rm -f "$out" 2>/dev/null || true
+    printf '%s\n' "key backup to $d failed - safeguard the key file itself: $id" >&2
+    return 1
+}
+
 STANDARD_KEY_SPOTS=(
     "${HOME}/.config/age/keys.txt"
     "${HOME}/.config/sops/age/keys.txt"
@@ -314,6 +346,18 @@ ensure_key() {
         || { rm -rf "$wdir"; shred -uzn1 "$id" 2>/dev/null; die "created key failed verification - nothing saved, run lockd again"; }
     rm -rf "$wdir"
     say "key created + verified: $id"
+    # the one-time safeguard: a backup lands on the Desktop the moment the
+    # key exists, and the user is told exactly once to protect it. These
+    # users know they are wearing purple - no reminders, ever, after this.
+    local bk
+    if bk=$(backup_key_to_desktop "$id"); then
+        say "backup: $bk - safeguard it (and the passphrase) now."
+        ( sleep 6
+          [[ -n "${DISPLAY:-}" ]] && command -v notify-send >/dev/null \
+              && notify-send --hint=int:transient:1 -t 10000 "lockd" \
+                 "key created. backup: $bk - safeguard it (and the passphrase) now."
+        ) 2>/dev/null &
+    fi
     NEW_KEY=1
 }
 
@@ -474,7 +518,38 @@ STUB
     [[ "$res" -eq 0 ]] \
         || { echo "FAIL: residue left behind: $(ls -A "$t/isotmp" | tr '\n' ' ')"; return 1; }
 
-    echo "selftest: PASS (file + directory roundtrips, wipe semantics, backend walk, clipboard chain, ctx scripts, real-flow decrypt + zero residue)"
+    # --- the Desktop backup + the restore story: backup -> destroy ->
+    # restore -> decrypt, THEN restore with hostile metadata (1999 mtime,
+    # 777 perms) -> still decrypts. age reads bytes; timestamps and
+    # permissions play no part in decryption. Machine-checked forever so
+    # the "cp it back into a fresh install" promise can never silently rot.
+    mkdir -p "$t/home/.config/lockd" "$t/home/Desktop"
+    local wrapcmd; wrapcmd=$(printf 'age -p -o %q %q' \
+        "$t/home/.config/lockd/identity.txt" "$t/testkey.txt")
+    printf 'selftestpw\nselftestpw\n' | script -qfec "$wrapcmd" /dev/null >/dev/null 2>&1 \
+        || { echo "FAIL: could not build wrapped identity for backup test"; return 1; }
+    local bk
+    bk=$(HOME="$t/home" backup_key_to_desktop "$t/home/.config/lockd/identity.txt") \
+        || { echo "FAIL: Desktop backup skipped"; return 1; }
+    [[ -f "$bk" && -s "$bk" ]] \
+        || { echo "FAIL: backup tarball missing or empty"; return 1; }
+    rm -f "$t/home/.config/lockd/identity.txt"
+    mkdir -p "$t/restore"
+    tar -xzf "$bk" -C "$t/restore" || { echo "FAIL: backup tarball unreadable"; return 1; }
+    local rt1cmd; rt1cmd=$(printf 'age -d -i %q -o %q %q' "$t/restore/identity.txt" "$t/rt1.txt" "$t/plain.txt.age")
+    printf 'selftestpw\n' | script -qfec "$rt1cmd" /dev/null >/dev/null 2>&1
+    cmp -s "$t/roundtrip.txt" "$t/rt1.txt" \
+        || { echo "FAIL: restored key did not decrypt the payload"; return 1; }
+    # hostile metadata: the copy-back with every filemarker wrong
+    touch -d "1999-01-01 00:00:00" "$t/restore/identity.txt"
+    chmod 777 "$t/restore/identity.txt"
+    cp -f "$t/restore/identity.txt" "$t/home/.config/lockd/identity.txt"
+    local rt2cmd; rt2cmd=$(printf 'age -d -i %q -o %q %q' "$t/home/.config/lockd/identity.txt" "$t/rt2.txt" "$t/plain.txt.age")
+    printf 'selftestpw\n' | script -qfec "$rt2cmd" /dev/null >/dev/null 2>&1
+    cmp -s "$t/roundtrip.txt" "$t/rt2.txt" \
+        || { echo "FAIL: hostile-metadata copy-back did not decrypt"; return 1; }
+
+    echo "selftest: PASS (file + directory roundtrips, wipe semantics, backend walk, clipboard chain, ctx scripts, real-flow decrypt + zero residue, backup-restore incl. hostile metadata)"
 }
 
 pick_files() {  # -> paths on stdout (empty on cancel)
