@@ -17,9 +17,9 @@ lockd --selftest             → prove the roundtrip, headless
 
 And some handy aliases to **.bash_aliases**:
 
-alias lock='lockd %F'
-alias unlock='lockd -d %F'
-alias erase='lockd --shred %F'
+- alias lock='lockd %F'
+- alias unlock='lockd -d %F'
+- alias erase='lockd --shred %F'
 
 
 ## THE RULE
