@@ -16,7 +16,7 @@ lockd --fast                 → this run: no offers, just lock it
 lockd --selftest             → prove the roundtrip, headless
 ```
 
-## THE RULE (announced, as promised)
+## THE RULE
 
 **The original is wiped by default.** The literature says so; the code keeps
 the promise — but the wipe can never lie:
@@ -70,4 +70,4 @@ level. And in george, lockd is a chip: one line in `buttons.toml`.
 
 ## License
 
-MIT, machiner — like the rest of the family.
+MIT
