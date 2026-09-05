@@ -1,9 +1,8 @@
-# lockd — lazy, kind encryption for regular humans
+# lockd — lazy, kind encryption
 
 
-One word encrypts a file or a directory. `age` does the cryptography
-(Debian-packaged, MIT, modern); lockd does the *everything else* — the part
-that has kept regular people from encrypting anything for decades.
+Command line: $ lock (whatever), or handy right-click in Thunar. `age` does the cryptography
+(Debian-packaged, MIT, modern); lockd does the *everything else* — people don't encrypt because 'complicated'. Nah.
 
 [![lockd command line — click to play](cmdlnlockd_t35.jpg)](https://github.com/user-attachments/assets/43247bdc-fa3a-42a3-826e-e79db5341cc5)
 
