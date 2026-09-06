@@ -426,9 +426,9 @@ usage() {
 lockd — lazy, kind encryption (age underneath)
 
   lockd [paths...]          encrypt files (or a directory: one archive)
-  lockd --shred paths...    secure-wipe any file. no questions asked -
-                            it goes, and lockd reports:
-                            "and just like that...gone"
+  lockd --shred paths...    secure-wipe any file or directory tree.
+                            no questions asked - it goes, and lockd
+                            reports: "and just like that...gone"
   lockd -d paths...         decrypt .age files (originals of THIS run are
                             .age files; shredding them is offered, not forced)
                             directory archives restore the tree in place -
@@ -814,7 +814,8 @@ do_encrypt() {
 }
 
 do_shred() {
-    # the wipe rule's machinery, standing alone: secure-wipe any file.
+    # the wipe rule's machinery, standing alone: secure-wipe any file
+    # or directory tree (files inside shredded, tree removed).
     # no confirmation, no victory lap: shred is a monster, and issuing it
     # IS the confirmation. it speaks once, after the fact:
     # "and just like that...gone".
@@ -827,11 +828,22 @@ do_shred() {
     fi
     local p n=0
     for p in "${paths[@]}"; do
-        if [[ -f "$p" ]]; then
+        if [[ -d "$p" && ! -L "$p" ]]; then
+            # directory: the same recursive wipe the verified encrypt
+            # flow uses - shred every regular file inside, then remove
+            # the tree. no lockd flag involved; erase means erase.
+            local f
+            while IFS= read -r -d '' f; do
+                shred -uzn1 "$f" 2>/dev/null \
+                    || printf 'lockd: survived: %s (shred failed)\n' "$f" >&2
+            done < <(find "$p" -type f -print0)
+            rm -rf -- "$p" && { say "gone: $p (directory, every file inside)"; n=$((n+1)); } \
+                || printf 'lockd: survived: %s (tree removal failed)\n' "$p" >&2
+        elif [[ -f "$p" ]]; then
             shred -uzn1 "$p" && { say "gone: $p"; n=$((n+1)); } \
                 || printf 'lockd: survived: %s (shred failed)\n' "$p" >&2
         else
-            say "skip: $p (not a regular file; shred is for files - lockd handles directories by encrypting them, not by erasing them)"
+            say "skip: $p (not a regular file or directory)"
         fi
     done
     (( n > 0 )) && notify -t 3000 "and just like that...gone"

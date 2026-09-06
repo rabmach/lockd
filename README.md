@@ -32,6 +32,8 @@ unlock rambler1.txt.age
 unlock taxes.tar.gz.age --open        # decrypted result opened for you
 lock --keep rambler1.txt              # original survives, verification still runs
 erase old-notes.txt                   # just shred, no crypto
+erase from-iphone/                    # a directory: every file inside
+                                      # shredded, tree removed, gone.
 ```
 
 `erase` asks nothing. Shred is issued to make a thing gone, so it goes —
