@@ -832,12 +832,18 @@ do_shred() {
             # directory: the same recursive wipe the verified encrypt
             # flow uses - shred every regular file inside, then remove
             # the tree. no lockd flag involved; erase means erase.
-            local f
+            # the tree can be big and shred flushes EVERY file to disk
+            # (that is the point of shred) - say what is happening up
+            # front and per file, so silence never looks like a hang.
+            local f nf=0
+            say "shred: $p - wiping every file inside (one sync per file: this takes a moment on big trees)..."
             while IFS= read -r -d '' f; do
                 shred -uzn1 "$f" 2>/dev/null \
+                    && { say "gone: $f"; nf=$((nf+1)); } \
                     || printf 'lockd: survived: %s (shred failed)\n' "$f" >&2
             done < <(find "$p" -type f -print0)
-            rm -rf -- "$p" && { say "gone: $p (directory, every file inside)"; n=$((n+1)); } \
+            rm -rf -- "$p" \
+                && { say "gone: $p (directory): ${nf} file(s) wiped"; n=$((n+1)); } \
                 || printf 'lockd: survived: %s (tree removal failed)\n' "$p" >&2
         elif [[ -f "$p" ]]; then
             shred -uzn1 "$p" && { say "gone: $p"; n=$((n+1)); } \
