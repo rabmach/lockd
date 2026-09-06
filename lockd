@@ -45,8 +45,11 @@ DLG=""             # resolved dialog backend ("" until dlg_backend runs)
 
 say()  { printf '%s\n' "$*"; }
 notify() {  # GUI runs have no stdout - speak through the desktop instead
+    # optional first arg: "-t MS" (notify-send expire timeout, milliseconds)
+    local -a to=()
+    if [[ "${1:-}" == "-t" ]]; then to=(-t "$2"); shift 2; fi
     [[ -n "${DISPLAY:-}" ]] && command -v notify-send >/dev/null \
-        && notify-send --hint=int:transient:1 "lockd" "$*" 2>/dev/null || true
+        && notify-send "${to[@]+${to[@]}}" --hint=int:transient:1 "lockd" "$*" 2>/dev/null || true
 }
 need() { command -v "$1" >/dev/null || die "missing: $1"; }
 
@@ -366,7 +369,9 @@ usage() {
 lockd — lazy, kind encryption (age underneath)
 
   lockd [paths...]          encrypt files (or a directory: one archive)
-  lockd --shred paths...    secure-wipe any file (no encryption involved)
+  lockd --shred paths...    secure-wipe any file. no questions asked -
+                            it goes, and lockd reports:
+                            "and just like that...gone"
   lockd -d paths...         decrypt .age files (originals of THIS run are
                             .age files; shredding them is offered, not forced)
                             directory archives restore the tree in place -
@@ -752,21 +757,28 @@ do_encrypt() {
 }
 
 do_shred() {
-    # the wipe rule's machinery, standing alone: secure-wipe any file
+    # the wipe rule's machinery, standing alone: secure-wipe any file.
+    # no confirmation, no victory lap: shred is a monster, and issuing it
+    # IS the confirmation. it speaks once, after the fact:
+    # "and just like that...gone".
+    # (2026-09-06: the yad confirm + per-file pop-ups went away - two
+    # dialogs in the face of a user who already decided was one too many)
     local paths=("$@")
     if (( ${#paths[@]} == 0 )); then
         mapfile -t paths < <(dlg_pick "lockd — pick file(s) to wipe")
         (( ${#paths[@]} > 0 )) || die "nothing picked"
     fi
-    dlg_q "Securely wipe ${#paths[@]} item(s)?\nThis cannot be undone." || die "cancelled"
-    local p
+    local p n=0
     for p in "${paths[@]}"; do
         if [[ -f "$p" ]]; then
-            shred -uzn1 "$p" && notify "wiped: $(basename "$p")" && say "wiped: $p"
+            shred -uzn1 "$p" && { say "gone: $p"; n=$((n+1)); } \
+                || printf 'lockd: survived: %s (shred failed)\n' "$p" >&2
         else
             say "skip: $p (not a regular file)"
         fi
     done
+    (( n > 0 )) && notify -t 3000 "and just like that...gone"
+    return 0
 }
 
 do_decrypt() {

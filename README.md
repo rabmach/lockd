@@ -34,6 +34,12 @@ lock --keep rambler1.txt              # original survives, verification still ru
 erase old-notes.txt                   # just shred, no crypto
 ```
 
+`erase` asks nothing. Shred is issued to make a thing gone, so it goes —
+no confirm, no ceremony — and the whole report arrives in one line,
+three seconds on screen: **and just like that...gone**. Invoking shred
+is the confirmation.
+```
+
 
 ## THE RULE
 
