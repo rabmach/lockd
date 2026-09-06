@@ -124,6 +124,11 @@ tool (`yad`/`zenity`/`kdialog`), a clipboard helper (`wl-clipboard`/
 `xclip`/`xsel`), `libnotify` for the notifications. Missing the soft
 stuff just means lockd skips that offer — or runs in terminal mode.
 
+**Distro maker?** PACKAGING.md in this repo is your whole on-ramp:
+system-wide artifacts, `/etc/skel` templates, merge rules that never
+clobber user configs, smoke test. Bundle lockd without ever thinking
+about it again.
+
 ## Phase 2 (parked on purpose)
 
 **Encrypted email-to-self** — lock the file, your mail client attaches
