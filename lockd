@@ -127,6 +127,43 @@ dlg_form() {
     printf '%s' "$out"
 }
 
+dlg_note() {  # info window (tty: plain line); best-effort, never fatal
+    dlg_backend
+    case "$DLG" in
+        yad)     yad --title="lockd" --borders=12 --info --text="$*" --width=420 2>/dev/null || true ;;
+        zenity)  zenity --info --title="lockd" --text="$*" 2>/dev/null || true ;;
+        kdialog) kdialog --title lockd --msgbox "$*" 2>/dev/null || true ;;
+        tty)     printf '%b\n' "lockd: $*" >&2 ;;   # stderr: stdout carries form data
+    esac
+}
+
+dlg_creds() {  # passphrase + confirm (+ fastpath flag), with immediate fix-up.
+  # a mismatch or an empty pair does NOT kick you out of the flow: the form
+  # re-shows right away. after three strikes, lockd says the thing:
+  # no, man - you should NOT call her. move on. get a grip. focus.
+  # (figured it will resonate with ~44% of the user base)
+  # -> three lines on stdout: passphrase, confirm, TRUE|FALSE. rc!=0 = give up.
+  local attempt out f upw cpw chk
+  for attempt in 1 2 3; do
+      out=$(dlg_form) || return 1
+      mapfile -t f <<<"$out"
+      upw="${f[0]:-}"; cpw="${f[1]:-}"; chk="${f[2]:-FALSE}"
+      if [[ -n "$upw" && "$upw" == "$cpw" ]]; then
+          printf '%s' "$out"
+          return 0
+      fi
+      if (( attempt < 3 )); then
+          if [[ -z "$upw" ]]; then
+              dlg_note "Empty passphrase. Once more: type it in both lines."
+          else
+              dlg_note "Those two lines did not match. Once more - slow, this time.\n(attempt ${attempt} of 3)"
+          fi
+      fi
+  done
+  dlg_note "No, man - you should NOT call her.\nMove on. Get a grip. And focus."
+  return 1
+}
+
 die() {  # stderr always; GUI backends also get a window
     printf 'lockd: %s\n' "$*" >&2
     dlg_backend
@@ -239,23 +276,42 @@ config_set() {
 # unlock the passphrase-encrypted identity via a pty (age reads
 # passphrases from the terminal only; script(1) provides the terminal).
 # Returns 0 and echoes the temp plaintext-identity path on success.
+# 2026-09-06: mismatch fix-up (dlg_creds) + wrong-passphrase retry (3
+# strikes each) + the creds are unset the moment they are consumed -
+# sometimes a typed passphrase is REAL; it should vanish the instant its
+# work is done. (The earlier tty bug: dlg_note printed to stdout and got
+# captured INTO the form data - the key could be born guarded by the
+# warning text itself. Notes now speak on stderr only.)
+lockd_slam() {  # three strikes; the reminder 44% of us know by heart
+    dlg_note "No, man - you should NOT call her.\nMove on. Get a grip. And focus."
+    return 1
+}
+
 unlock_identity() {
-    local pw wdir tmpid
+    local wdir tmpid attempt out ok=0
     wdir=$(mktemp -d "${TMPDIR:-/tmp}/lockd-id.XXXXXX")
     tmpid="$wdir/id"                       # must NOT exist: age refuses -o over
     chmod 600 "$tmpid" 2>/dev/null || true
-    local out
-    out=$(dlg_form) || { rm -rf "$wdir"; die "cancelled"; }
     local f upw cpw chk
-    mapfile -t f <<<"$out"
-    upw="${f[0]:-}"; cpw="${f[1]:-}"; chk="${f[2]:-FALSE}"
-    [[ "$upw" == "$cpw" ]] || { shred -uzn1 "$tmpid" 2>/dev/null; rm -rf "$wdir"; die "passphrases do not match"; }
-    [[ -n "$upw" ]] || { shred -uzn1 "$tmpid" 2>/dev/null; rm -rf "$wdir"; die "empty passphrase"; }
-    if [[ "$chk" == TRUE ]]; then config_set fast_path 1; fi
     local cmd
     cmd=$(printf 'age -d -o %q %q' "$tmpid" "$(identity_path)")
-    printf '%s\n' "$upw" | script -qfec "$cmd" /dev/null >/dev/null 2>&1 \
-        || { shred -uzn1 "$tmpid" 2>/dev/null; rm -rf "$wdir"; die "wrong passphrase (or no key): unlock failed"; }
+    for attempt in 1 2 3; do
+        out=$(dlg_creds) || { rm -rf "$wdir"; exit 1; }  # dlg_creds already had the last word
+        mapfile -t f <<<"$out"
+        unset out
+        upw="${f[0]:-}"; cpw="${f[1]:-}"; chk="${f[2]:-FALSE}"
+        unset cpw f
+        if [[ "$chk" == TRUE ]]; then config_set fast_path 1; fi
+        unset chk
+        if printf '%s\n' "$upw" | script -qfec "$cmd" /dev/null >/dev/null 2>&1; then
+            unset upw
+            ok=1
+            break
+        fi
+        unset upw
+        (( attempt < 3 )) && dlg_note "Wrong passphrase for that key. Once more.\n(attempt ${attempt} of 3)"
+    done
+    (( ok == 1 )) || { rm -rf "$wdir"; lockd_slam; exit 1; }
     # the unlocked file must contain a real secret key - catches corrupt
     # or wrong-file identities instead of failing later, mid-flow
     grep -q "AGE-SECRET-KEY-" "$tmpid" \
@@ -318,12 +374,11 @@ ensure_key() {
     dlg_q "No default AGE key found.\n(gpg keys are a different system - they do not apply here.)\n\nCreate one now? It becomes your lockd default.\nLives at: ${IDENTITY}" \
         || die "no key, no lock"
     local out
-    out=$(dlg_form) || die "cancelled"
+    out=$(dlg_creds) || exit 1  # dlg_creds already had the last word
     local f npw cpw chk
     mapfile -t f <<<"$out"
     npw="${f[0]:-}"; cpw="${f[1]:-}"; chk="${f[2]:-FALSE}"
     [[ -n "$npw" ]] || die "empty passphrase"
-    [[ "$npw" == "$cpw" ]] || die "passphrases do not match"
     if [[ "$chk" == TRUE ]]; then config_set fast_path 1; fi
     mkdir -p "$CONFIG_DIR"
     local id; id=$(identity_path)
@@ -337,7 +392,8 @@ ensure_key() {
     local cmd
     cmd=$(printf 'age -p -o %q %q' "$id" "$plain")
     printf '%s\n%s\n' "$npw" "$npw" | script -qfec "$cmd" /dev/null >/dev/null 2>&1 \
-        || { rm -rf "$wdir"; die "key encryption failed"; }
+        || { rm -rf "$wdir"; unset npw cpw; die "key encryption failed"; }
+    unset cpw     # confirm's work is done
     shred -uzn1 "$plain"
     [[ -f "$id" ]] || { rm -rf "$wdir"; die "key creation produced nothing"; }
     chmod 600 "$id"; chmod 700 "$CONFIG_DIR" 2>/dev/null || true
@@ -346,7 +402,8 @@ ensure_key() {
     cmd=$(printf 'age -d -o %q %q' "$check" "$id")
     printf '%s\n%s\n' "$npw" "$npw" | script -qfec "$cmd" /dev/null >/dev/null 2>&1 \
         && grep -q "AGE-SECRET-KEY-" "$check" \
-        || { rm -rf "$wdir"; shred -uzn1 "$id" 2>/dev/null; die "created key failed verification - nothing saved, run lockd again"; }
+        || { rm -rf "$wdir"; shred -uzn1 "$id" 2>/dev/null; unset npw; die "created key failed verification - nothing saved, run lockd again"; }
+    unset npw    # the passphrase did its job; it leaves immediately
     rm -rf "$wdir"
     say "key created + verified: $id"
     # the one-time safeguard: a backup lands on the Desktop the moment the
@@ -774,7 +831,7 @@ do_shred() {
             shred -uzn1 "$p" && { say "gone: $p"; n=$((n+1)); } \
                 || printf 'lockd: survived: %s (shred failed)\n' "$p" >&2
         else
-            say "skip: $p (not a regular file)"
+            say "skip: $p (not a regular file; shred is for files - lockd handles directories by encrypting them, not by erasing them)"
         fi
     done
     (( n > 0 )) && notify -t 3000 "and just like that...gone"
